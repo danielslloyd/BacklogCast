@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BacklogCast</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>BacklogCast</h1>
+    <nav>
+      <button data-tab="queue" class="tab active">Queue</button>
+      <button data-tab="settings" class="tab">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="tab-queue" class="tab-panel active">
+      <div class="card">
+        <h2>Add article</h2>
+        <div class="row">
+          <input type="url" id="add-url" placeholder="https://example.com/article" />
+          <button id="add-url-btn">Fetch</button>
+        </div>
+        <details>
+          <summary>Paste text instead</summary>
+          <div class="col">
+            <input type="text" id="paste-title" placeholder="Title (optional)" />
+            <textarea id="paste-text" rows="8" placeholder="Cleaned article text..."></textarea>
+            <button id="paste-btn">Add pasted text</button>
+          </div>
+        </details>
+        <p id="add-status" class="status"></p>
+      </div>
+
+      <div class="card">
+        <div class="row between">
+          <h2>Articles</h2>
+          <div class="row">
+            <label>Filter:
+              <select id="state-filter">
+                <option value="">all</option>
+                <option value="fetched">fetched</option>
+                <option value="needs_review">needs_review</option>
+                <option value="approved">approved</option>
+                <option value="synthesizing">synthesizing</option>
+                <option value="ready">ready</option>
+                <option value="published">published</option>
+                <option value="failed">failed</option>
+              </select>
+            </label>
+            <button id="refresh-btn">Refresh</button>
+          </div>
+        </div>
+        <table id="articles-table">
+          <thead><tr>
+            <th>Title</th><th>State</th><th>Source</th><th>Duration</th><th>Actions</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card hidden" id="preview-card">
+        <div class="row between">
+          <h2 id="preview-title">Preview</h2>
+          <button id="preview-close">close</button>
+        </div>
+        <p class="status" id="preview-meta"></p>
+        <div class="preview-row">
+          <div class="preview-col">
+            <label>Title <input type="text" id="edit-title" /></label>
+            <label>Author <input type="text" id="edit-author" /></label>
+            <label>Markdown
+              <textarea id="edit-body" rows="20"></textarea>
+            </label>
+            <button id="save-btn">Save edits</button>
+          </div>
+          <div class="preview-col">
+            <div id="rendered" class="rendered"></div>
+          </div>
+        </div>
+        <div id="audio-wrap" class="hidden">
+          <audio id="audio-player" controls></audio>
+        </div>
+        <div class="row wrap">
+          <button id="reextract-btn">Re-extract</button>
+          <button id="approve-btn" class="primary">Approve for TTS</button>
+          <button id="retry-btn">Retry TTS</button>
+          <button id="publish-btn">Publish</button>
+          <button id="unpublish-btn">Unpublish</button>
+          <button id="delete-btn" class="danger">Delete</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel">
+      <div class="card">
+        <h2>Podcast settings</h2>
+        <div class="col">
+          <label>Title <input id="cfg-title" /></label>
+          <label>Description <textarea id="cfg-description" rows="3"></textarea></label>
+          <label>Language <input id="cfg-language" /></label>
+          <label>Author <input id="cfg-author" /></label>
+          <label>Owner name <input id="cfg-owner-name" /></label>
+          <label>Owner email <input id="cfg-owner-email" /></label>
+          <label>Category <input id="cfg-category" /></label>
+          <label>Explicit <input id="cfg-explicit" type="checkbox" /></label>
+          <label>Public base URL <input id="cfg-base-url" placeholder="https://your.tunnel.example" /></label>
+          <label>Words per minute (estimate) <input id="cfg-wpm" type="number" min="60" max="300" /></label>
+          <button id="save-config">Save settings</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Feed tokens</h2>
+        <p class="status">Anyone with a token can fetch the RSS feed and audio. Revoking a token blocks both immediately.</p>
+        <div class="row">
+          <input id="new-token-name" placeholder="e.g. alice, phone" />
+          <button id="create-token-btn">Create token</button>
+        </div>
+        <table id="tokens-table">
+          <thead><tr><th>Name</th><th>Feed URL</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

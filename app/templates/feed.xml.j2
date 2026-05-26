@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>{{ cfg.podcast_title | e }}</title>
+    <link>{{ base_url | e }}</link>
+    <atom:link href="{{ feed_url | e }}" rel="self" type="application/rss+xml" />
+    <description>{{ cfg.podcast_description | e }}</description>
+    <language>{{ cfg.podcast_language | e }}</language>
+    {% if cover_url %}<image>
+      <url>{{ cover_url | e }}</url>
+      <title>{{ cfg.podcast_title | e }}</title>
+      <link>{{ base_url | e }}</link>
+    </image>{% endif %}
+    <itunes:author>{{ cfg.podcast_author | e }}</itunes:author>
+    <itunes:summary>{{ cfg.podcast_description | e }}</itunes:summary>
+    <itunes:explicit>{{ 'true' if cfg.explicit else 'false' }}</itunes:explicit>
+    <itunes:category text="{{ cfg.category | e }}"/>
+    <itunes:owner>
+      <itunes:name>{{ cfg.owner_name | e }}</itunes:name>
+      <itunes:email>{{ cfg.owner_email | e }}</itunes:email>
+    </itunes:owner>
+    {% if cover_url %}<itunes:image href="{{ cover_url | e }}"/>{% endif %}
+    {% for item in items %}
+    <item>
+      <title>{{ item.title | e }}</title>
+      <itunes:title>{{ item.title | e }}</itunes:title>
+      {% if item.author %}<itunes:author>{{ item.author | e }}</itunes:author>{% endif %}
+      <description>{{ item.description | e }}</description>
+      <pubDate>{{ item.pub_date }}</pubDate>
+      <guid isPermaLink="false">backlogcast-{{ item.slug | e }}</guid>
+      <enclosure url="{{ item.audio_url | e }}" length="{{ item.audio_bytes }}" type="{{ item.mime }}" />
+      <itunes:duration>{{ item.duration_hms }}</itunes:duration>
+      {% if item.source_url %}<link>{{ item.source_url | e }}</link>{% endif %}
+    </item>
+    {% endfor %}
+  </channel>
+</rss>
