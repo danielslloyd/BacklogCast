@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import articles, extractor, feed, tts
+from . import articles, extractor, feed, lloydio, tts
 from .config import (
     create_token, load_config, load_tokens, public_base_url,
     revoke_token, save_config, token_valid,
@@ -25,15 +26,46 @@ log = logging.getLogger("backlogcast")
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
 
+class _LloydioPoller:
+    """Background thread that periodically ingests lloydio's queue (if enabled)."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="lloydio-poller", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            secs = 0
+            try:
+                secs = int(load_config().get("lloydio_poll_seconds", 0) or 0)
+                if secs > 0 and lloydio.sync().get("created"):
+                    tts.worker.kick()
+            except Exception:
+                log.exception("lloydio poll failed")
+            self._stop.wait(timeout=secs if secs and secs >= 30 else 60)
+
+
+poller = _LloydioPoller()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_data_tree()
     tts.worker.start()
+    poller.start()
     log.info("backlogcast ready")
     try:
         yield
     finally:
         tts.worker.stop()
+        poller.stop()
 
 
 app = FastAPI(title="BacklogCast", lifespan=lifespan)
@@ -64,6 +96,16 @@ class ConfigIn(BaseModel):
     explicit: bool | None = None
     public_base_url: str | None = None
     wpm: int | None = None
+    # integration settings (HENTY_API_KEY stays env-only, never persisted)
+    lloydio_base_url: str | None = None
+    henty_base_url: str | None = None
+    henty_books_dir: str | None = None
+    default_voice: str | None = None
+    asr_similarity_threshold: float | None = None
+    asr_max_retries: int | None = None
+    auto_approve: bool | None = None
+    auto_publish: bool | None = None
+    lloydio_poll_seconds: int | None = None
 
 
 class TokenIn(BaseModel):
@@ -122,11 +164,9 @@ def add_article(body: AddArticleIn) -> dict[str, Any]:
             raw_html=html,
             extraction_method=result["method"],
             author=result["author"],
+            state="needs_review" if result["confidence_low"] else "queued",
         )
-        if result["confidence_low"]:
-            articles.set_state(meta["slug"], "needs_review")
-        else:
-            articles.set_state(meta["slug"], "fetched")
+        tts.worker.kick()  # worker builds book.json (body already extracted)
         return _article_payload(meta["slug"], include_body=True)
     if body.text:
         title = (body.title or body.text.strip().split("\n", 1)[0] or "Pasted").strip()[:120]
@@ -138,10 +178,23 @@ def add_article(body: AddArticleIn) -> dict[str, Any]:
             raw_html=None,
             extraction_method="manual",
             author="",
+            state="queued",
         )
-        articles.set_state(meta["slug"], "fetched")
+        tts.worker.kick()
         return _article_payload(meta["slug"], include_body=True)
     raise HTTPException(400, "provide url or text")
+
+
+@app.post("/api/ingest/lloydio")
+def ingest_lloydio() -> dict[str, Any]:
+    """Poll lloydio's queue now and create local jobs for new podcast items."""
+    try:
+        res = lloydio.sync()
+    except Exception as e:
+        raise HTTPException(400, f"lloydio sync failed: {e}")
+    if res.get("created"):
+        tts.worker.kick()
+    return res
 
 
 @app.put("/api/articles/{slug}")
@@ -179,9 +232,11 @@ def reextract(slug: str) -> dict[str, Any]:
     )
     articles.set_state(
         slug,
-        "needs_review" if result["confidence_low"] else "fetched",
+        "needs_review" if result["confidence_low"] else "queued",
         extraction_method=result["method"],
     )
+    if not result["confidence_low"]:
+        tts.worker.kick()  # rebuild book.json from the re-extracted text
     return _article_payload(slug, include_body=True)
 
 
@@ -206,7 +261,7 @@ def retry(slug: str) -> dict[str, Any]:
 @app.post("/api/articles/{slug}/publish")
 def publish(slug: str) -> dict[str, Any]:
     meta = articles.load_meta(slug)
-    if meta.get("state") not in {"ready", "published"}:
+    if meta.get("state") not in articles.PUBLISHABLE:
         raise HTTPException(400, "article is not ready")
     articles.set_state(slug, "published", published_at=articles.utcnow_iso())
     return _article_payload(slug)
@@ -216,7 +271,7 @@ def publish(slug: str) -> dict[str, Any]:
 def unpublish(slug: str) -> dict[str, Any]:
     if not articles.meta_path(slug).exists():
         raise HTTPException(404, "not found")
-    articles.set_state(slug, "ready", published_at=None)
+    articles.set_state(slug, "stitched", published_at=None)
     return _article_payload(slug)
 
 

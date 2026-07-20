@@ -39,6 +39,62 @@ def public_base_url(request_host: str | None = None) -> str:
     return "http://127.0.0.1:8000"
 
 
+# --- integration settings (env var wins over config.json) -------------------
+
+def _setting(env_key: str, cfg_key: str, default: str = "") -> str:
+    env = os.environ.get(env_key, "").strip()
+    if env:
+        return env
+    return str(load_config().get(cfg_key, default)).strip()
+
+
+def lloydio_base_url() -> str:
+    return _setting("LLOYDIO_BASE_URL", "lloydio_base_url").rstrip("/")
+
+
+def henty_base_url() -> str:
+    return _setting("HENTY_BASE_URL", "henty_base_url", "http://127.0.0.1:5000").rstrip("/")
+
+
+def henty_api_key() -> str:
+    # Secret: env-only, never persisted to config.json.
+    return os.environ.get("HENTY_API_KEY", "").strip()
+
+
+def henty_books_dir() -> str:
+    return _setting("HENTY_BOOKS_DIR", "henty_books_dir")
+
+
+def default_voice() -> str:
+    return _setting("DEFAULT_VOICE", "default_voice", "Haggard")
+
+
+def asr_threshold() -> float:
+    env = os.environ.get("ASR_SIMILARITY_THRESHOLD", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    try:
+        return float(load_config().get("asr_similarity_threshold", 0.85))
+    except (TypeError, ValueError):
+        return 0.85
+
+
+def asr_max_retries() -> int:
+    env = os.environ.get("ASR_MAX_RETRIES", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        return int(load_config().get("asr_max_retries", 4))
+    except (TypeError, ValueError):
+        return 4
+
+
 def load_tokens() -> dict[str, str]:
     return json.loads(TOKENS_PATH.read_text())
 
