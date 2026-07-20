@@ -165,6 +165,16 @@ def _norm_similarity(raw: Any) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
+def _take_truncated(gen: dict[str, Any], audio_file: str | None) -> bool:
+    """`possibly_truncated` lives on the new take inside `chunk.generated_audios`,
+    NOT at the top level of the generate-chunk-audio response."""
+    takes = (gen.get("chunk") or {}).get("generated_audios") or []
+    for t in takes:
+        if audio_file and t.get("audio_file") == audio_file:
+            return bool(t.get("possibly_truncated"))
+    return bool(takes[-1].get("possibly_truncated")) if takes else False
+
+
 def synthesize_chunk_with_retries(
     client: HentyClient, text_file_id: Any, chunk_id: Any, chunk_text: str, *,
     voice_sample: str | None = None, threshold: float | None = None,
@@ -191,9 +201,9 @@ def synthesize_chunk_with_retries(
             voice_sample=voice_sample, temperature=temperature, tts_model=tts_model,
         )
         audio_file = gen.get("audio_file")
-        truncated = bool(gen.get("possibly_truncated"))
         if not audio_file:
             continue  # generation produced nothing; try again
+        truncated = bool(gen.get("possibly_truncated")) or _take_truncated(gen, audio_file)
         tr = client.transcribe_take(audio_file, compare_text, text_file_id, chunk_id)
         sim = _norm_similarity(tr.get("similarity_score"))
         key = (0 if truncated else 1, sim)

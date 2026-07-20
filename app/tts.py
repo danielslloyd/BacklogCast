@@ -140,12 +140,15 @@ def process_queued(slug: str) -> None:
 def _fetch_stitched(client: henty.HentyClient, st: dict, dest_dir: str) -> Path | None:
     """Get one stitched chapter WAV onto local disk. Prefers a co-located file
     under HENTY_BOOKS_DIR; otherwise downloads it over HTTP."""
-    fname = st.get("stitched_filename")
+    # stitch response keys are unconfirmed upstream; read defensively
+    fname = (st.get("stitched_filename") or st.get("filename")
+             or st.get("published_file") or st.get("output"))
     books_dir = config.henty_books_dir()
     if fname and books_dir:
         for cand in Path(books_dir).rglob(fname):
             return cand
-    url = st.get("stitched_url") or (f"/api/project/audio/{fname}" if fname else None)
+    # stitched/published WAVs are served at /api/published/<file>
+    url = st.get("stitched_url") or (f"/api/published/{fname}" if fname else None)
     if not url:
         return None
     try:

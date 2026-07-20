@@ -39,7 +39,9 @@ class FakeClient:
         af, trunc, sim = self.script[self.i]
         self.i += 1
         self._last_sim = sim
-        return {"audio_file": af, "possibly_truncated": trunc}
+        # real Henty shape: possibly_truncated is nested in chunk.generated_audios
+        return {"success": True, "audio_file": af, "audio_url": f"/api/audio/{af}",
+                "chunk": {"generated_audios": [{"audio_file": af, "possibly_truncated": trunc}]}}
 
     def transcribe_take(self, audio_file, text, tfid, cid):
         return {"similarity_score": self._last_sim}
