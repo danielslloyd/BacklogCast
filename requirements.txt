@@ -1,3 +1,5 @@
+# TTS is provided by Henty (a separate, GPU-only service) — no torch/chatterbox
+# is installed here. This process is the local orchestrator + feed host.
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 httpx==0.27.2

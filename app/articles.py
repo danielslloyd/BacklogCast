@@ -12,15 +12,21 @@ from slugify import slugify
 
 from .paths import ARTICLES_DIR, article_dir
 
+# Job lifecycle for the lloydio -> Henty -> local-feed pipeline.
 STATES = {
-    "fetched",
-    "needs_review",
-    "approved",
-    "synthesizing",
-    "ready",
-    "published",
-    "failed",
+    "queued",        # ingested from lloydio / manually added; awaiting processing
+    "extracting",    # fetch + clean + build book.json (transient)
+    "book_built",    # book.json ready; awaiting approval (auto or manual)
+    "needs_review",  # flagged for human review/annotation before synthesis
+    "approved",      # cleared for synthesis; the TTS worker picks these up
+    "synthesizing",  # Henty generation + ASR feedback loop in progress
+    "stitched",      # audio ready locally; awaiting publish
+    "published",     # included in the feed
+    "failed",        # error; see the `error` field
 }
+
+# States from which the article can be (re)published into the feed.
+PUBLISHABLE = {"stitched", "published"}
 
 
 def utcnow_iso() -> str:
@@ -137,6 +143,16 @@ def audio_path(slug: str) -> Path | None:
     return p if p.exists() else None
 
 
+def find_by_source_url(url: str) -> dict[str, Any] | None:
+    """Return the first article whose source_url matches, else None (dedupe)."""
+    if not url:
+        return None
+    for meta in iter_articles():
+        if meta.get("source_url") == url:
+            return meta
+    return None
+
+
 def new_article(
     *,
     title: str,
@@ -145,13 +161,14 @@ def new_article(
     raw_html: str | None,
     extraction_method: str,
     author: str = "",
+    state: str = "queued",
 ) -> dict[str, Any]:
     slug = make_slug(title)
     d = article_dir(slug)
     d.mkdir(parents=True, exist_ok=True)
     meta = {
         "slug": slug,
-        "state": "needs_review",
+        "state": state,
         "title": title or "Untitled",
         "author": author,
         "source_url": source_url or "",
@@ -162,6 +179,10 @@ def new_article(
         "audio_filename": None,
         "audio_bytes": None,
         "extraction_method": extraction_method,
+        # integration fields
+        "book_json_path": None,      # where we wrote Henty's book.json
+        "henty_project_path": None,  # Henty project.json path after import
+        "chunk_reports": [],         # [{chunk_id, similarity, retries, truncated}]
         "error": None,
     }
     save_meta(slug, meta)

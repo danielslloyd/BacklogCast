@@ -79,7 +79,9 @@ def extract(html: str, url: str | None = None) -> dict[str, Any]:
         if rd_md and len(rd_md.strip()) > len(md.strip()):
             md, title, author, method = rd_md, rd_title or title, rd_author or author, "readability"
     return {
-        "body": tts_clean(md),
+        # Keep the markdown structure (headings/paragraphs). app.bookjson parses
+        # it into chapters/chunks and sanitizes each span for TTS at synth time.
+        "body": (md or "").strip() + "\n",
         "title": title,
         "author": author,
         "method": method,
@@ -87,43 +89,93 @@ def extract(html: str, url: str | None = None) -> dict[str, Any]:
     }
 
 
-# --- TTS-readiness pass ----------------------------------------------------
+# --- TTS text sanitizing ----------------------------------------------------
+# Henty (Chatterbox) has NO markdown sanitizer of its own: any stray '#', '*',
+# '_', backticks, or link/footnote syntax reaches the model and gets vocalized
+# as gibberish. We strip all of it before synthesis. Block *structure*
+# (headings/paragraphs) is detected by app.bookjson before this runs per-span,
+# so `sanitize_inline` only has to clean a single span of prose.
 
-_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
-_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_REF_LINK_RE = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
+_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _CODE_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+# emphasis delimiters, longest first, with a backreference to the same closer
+_EMPHASIS_RE = re.compile(r"(\*\*\*|\*\*|\*|___|__|_)(\S.*?\S|\S)\1")
+_FOOTNOTE_RE = re.compile(r"\[\^?\d+\]")          # [3] or [^1] citation markers
+_STRAY_MD_RE = re.compile(r"[*_`#>]+")            # safety net for leftovers
+_HR_RE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _MULTI_BLANK_RE = re.compile(r"\n{3,}")
 _MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
 
+_PUNCT_MAP = {
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "–": "-", "—": "-", "…": "...", " ": " ",
+    "·": " ", "&": " and ", "%": " percent",
+}
+
+
+def _normalize_punct(text: str) -> str:
+    for k, v in _PUNCT_MAP.items():
+        text = text.replace(k, v)
+    return text
+
+
+def sanitize_inline(text: str) -> str:
+    """Strip inline markdown/markup from a single span of prose, for TTS."""
+    if not text:
+        return ""
+    text = _IMAGE_RE.sub("", text)
+    text = _LINK_RE.sub(r"\1", text)
+    text = _REF_LINK_RE.sub(r"\1", text)
+    text = _INLINE_CODE_RE.sub(r"\1", text)
+    # twice, to catch simple nesting like **_word_**
+    text = _EMPHASIS_RE.sub(r"\2", text)
+    text = _EMPHASIS_RE.sub(r"\2", text)
+    text = _FOOTNOTE_RE.sub("", text)
+    text = _normalize_punct(text)
+    text = _STRAY_MD_RE.sub("", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    return text.strip()
+
+
+def _fence_replacer(match: re.Match[str]) -> str:
+    body = match.group(1)
+    looks_like_prose = (
+        " " in body
+        and not re.search(r"[{};=()<>]{2,}", body)
+        and sum(1 for ch in body if ch.isalpha()) > len(body) * 0.5
+    )
+    return body if looks_like_prose else ""
+
+
+def strip_block_marker(line: str) -> str:
+    """Remove a leading markdown block marker (heading/list/quote) from a line."""
+    line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+    line = re.sub(r"^\s{0,3}>\s?", "", line)
+    line = re.sub(r"^\s{0,3}([-*+]|\d+[.)])\s+", "", line)
+    return line
+
 
 def tts_clean(md: str) -> str:
+    """Fully clean markdown/text into plain prose paragraphs for TTS.
+
+    Preserves paragraph breaks (blank-line separated) but removes ALL markdown
+    (headings, lists, quotes, emphasis, links, code, footnotes). Used for the
+    manual pasted-text path and as a general-purpose cleaner.
+    """
     if not md:
         return ""
-    # replace links with their visible text
-    md = _LINK_RE.sub(r"\1", md)
-    # drop images entirely
-    md = _IMAGE_RE.sub("", md)
-    # keep code fence contents only if they look like prose (have spaces, no `;{}` cluster)
-    def _fence(match: re.Match[str]) -> str:
-        body = match.group(1)
-        looks_like_prose = (
-            " " in body
-            and not re.search(r"[{};=()<>]{2,}", body)
-            and sum(1 for ch in body if ch.isalpha()) > len(body) * 0.5
-        )
-        return body if looks_like_prose else ""
-    md = _CODE_FENCE_RE.sub(_fence, md)
-    # inline code → bare text
-    md = _INLINE_CODE_RE.sub(r"\1", md)
-    # normalize smart quotes / dashes
-    md = (
-        md.replace("‘", "'").replace("’", "'")
-        .replace("“", '"').replace("”", '"')
-        .replace("–", "-").replace("—", "-")
-        .replace("…", "...")
-    )
-    # collapse whitespace
-    md = _MULTI_SPACE_RE.sub(" ", md)
-    md = _MULTI_BLANK_RE.sub("\n\n", md)
-    return md.strip() + "\n"
+    md = _CODE_FENCE_RE.sub(_fence_replacer, md)
+    out: list[str] = []
+    for raw in re.split(r"\n\s*\n", md):
+        lines = []
+        for ln in raw.splitlines():
+            if _HR_RE.match(ln) or not ln.strip():
+                continue
+            lines.append(strip_block_marker(ln.strip()))
+        cleaned = sanitize_inline(" ".join(l for l in lines if l))
+        if cleaned:
+            out.append(cleaned)
+    return "\n\n".join(out) + "\n" if out else ""

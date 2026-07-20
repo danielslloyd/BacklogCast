@@ -23,6 +23,25 @@ DEFAULT_CONFIG = {
     "explicit": False,
     "public_base_url": "",
     "wpm": 160,
+    # --- integration: lloydio (ingest) + Henty (TTS) ---
+    # lloydio hosts capture + the /api/podcast-queue.json work queue we poll.
+    "lloydio_base_url": "",
+    # Henty is the local GPU TTS studio (Flask). API key is env-only (HENTY_API_KEY).
+    "henty_base_url": "http://127.0.0.1:5000",
+    # Directory Henty scans for book.json projects. Empty = don't drop book.json
+    # locally (assume a shared/mounted path is configured on the Henty box).
+    "henty_books_dir": "",
+    # Reference voice sample name in Henty's voice_samples/ (never its built-in default).
+    "default_voice": "Haggard",
+    # ASR feedback loop: regenerate a chunk while Whisper similarity is below this,
+    # up to this many tries, keeping the best-scoring take.
+    "asr_similarity_threshold": 0.85,
+    "asr_max_retries": 4,
+    # Auto-advance jobs through approve/publish gates (True) or require the UI (False).
+    "auto_approve": True,
+    "auto_publish": True,
+    # background poll of lloydio's queue, in seconds (0 = disabled)
+    "lloydio_poll_seconds": 0,
 }
 
 

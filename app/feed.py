@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from . import articles
+from . import articles, extractor
 from .config import load_config, public_base_url
 from .paths import COVER_PATH
 
@@ -62,7 +62,8 @@ def render_feed(token: str, request_host: str | None = None) -> str:
         slug = m["slug"]
         fname = m.get("audio_filename") or "audio.mp3"
         ext = Path(fname).suffix.lstrip(".") or "mp3"
-        body_snippet = articles.load_body(slug)[:500].strip()
+        # body is stored as markdown now; strip it for a clean episode summary
+        body_snippet = extractor.tts_clean(articles.load_body(slug))[:500].strip()
         items.append({
             "slug": slug,
             "title": m.get("title") or slug,
