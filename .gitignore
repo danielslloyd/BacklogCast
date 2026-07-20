@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+backlogcast.env.bat
 .idea/
 .vscode/
 data/

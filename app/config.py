@@ -95,6 +95,19 @@ def asr_max_retries() -> int:
         return 4
 
 
+def lloydio_poll_seconds() -> int:
+    env = os.environ.get("LLOYDIO_POLL_SECONDS", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        return int(load_config().get("lloydio_poll_seconds", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def load_tokens() -> dict[str, str]:
     return json.loads(TOKENS_PATH.read_text())
 
