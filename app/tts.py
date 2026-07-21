@@ -169,9 +169,12 @@ def synthesize(slug: str) -> None:
             raise henty.HentyError(
                 "HENTY_BOOKS_DIR not configured; cannot hand book.json to Henty"
             )
-        if not (Path(books_dir) / slug / "book.json").exists():
+        book_folder = Path(books_dir) / slug
+        if not (book_folder / "book.json").exists():
             build_book(slug)
-        henty.run_importer()  # needs HENTY_DIR; raises with guidance otherwise
+        ok, out = henty.run_importer(folder=str(book_folder))
+        if not ok:
+            raise henty.HentyError(f"book import failed: {out}")
         project_path = henty.project_path_for(slug)
 
         with henty.HentyClient() as client:
@@ -244,7 +247,8 @@ class TTSWorker:
                     continue
                 approved = sorted(articles.iter_articles(state="approved"),
                                   key=lambda m: m.get("approved_at") or "")
-                if approved:
+                # Only synthesize when Henty (GPU) is up; else jobs wait in `approved`.
+                if approved and henty.is_available():
                     synthesize(approved[0]["slug"])
                     continue
             except Exception:

@@ -16,6 +16,30 @@ This app is a single FastAPI process: ingest, JSON API, a background worker that
 drives Henty, the RSS feed, and audio streaming — all on one port. It has **no
 in-process TTS**; Henty does all synthesis.
 
+## Quick start (Windows, one-click)
+
+On the Henty/GPU box (co-located with Henty):
+
+1. **Permanent public feed URL** — run `setup_cloudflare_tunnel.bat` (as admin): it
+   installs `cloudflared`, connects a named **Cloudflare Tunnel** on your account, and
+   runs it as an always-on service. In the Cloudflare dashboard add a Public Hostname
+   `podcast.<your-domain>` → `HTTP 127.0.0.1:8000` (no Access policy — the feed must stay
+   public). Requires your site's domain to be a zone in the same Cloudflare account.
+2. **Configure** — double-click `start_backlogcast.bat` once; it copies
+   `backlogcast.env.example.bat` → `backlogcast.env.bat` (gitignored) and opens it. Fill in
+   your Henty `API_KEY`, `HENTY_BOOKS_DIR`/`HENTY_DIR`, `LLOYDIO_BASE_URL`, and
+   `PUBLIC_BASE_URL=https://podcast.<your-domain>`.
+3. **Run** — double-click `start_backlogcast.bat` again. First run builds the venv and
+   installs deps; it also starts Henty (if not already up), then launches the app and
+   opens the UI at <http://127.0.0.1:8000>.
+4. **Subscribe** — Settings → copy the feed token → subscribe Pocket Casts to
+   `https://podcast.<your-domain>/feed/<token>.xml`.
+5. **Always-on (optional)** — `install_startup_task.bat` auto-starts the app at logon so
+   the feed stays reachable for background auto-download.
+
+After that, sharing a link to lloydio (podcast checkbox) auto-ingests within
+`LLOYDIO_POLL_SECONDS`, synthesizes when Henty is up, and lands on your phone.
+
 ## The three systems
 
 - **lloydio** (Astro, hosted) owns **capture** and **the feed's source of new

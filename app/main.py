@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import articles, extractor, feed, lloydio, tts
 from .config import (
-    create_token, load_config, load_tokens, public_base_url,
+    create_token, lloydio_poll_seconds, load_config, load_tokens, public_base_url,
     revoke_token, save_config, token_valid,
 )
 from .paths import COVER_PATH, ensure_data_tree, article_dir
@@ -44,7 +44,7 @@ class _LloydioPoller:
         while not self._stop.is_set():
             secs = 0
             try:
-                secs = int(load_config().get("lloydio_poll_seconds", 0) or 0)
+                secs = lloydio_poll_seconds()
                 if secs > 0 and lloydio.sync().get("created"):
                     tts.worker.kick()
             except Exception:

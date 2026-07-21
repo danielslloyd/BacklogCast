@@ -109,7 +109,7 @@ class HentyClient:
         self, text_file_id: Any, chunk_id: Any, chunk_text: str, *,
         voice_sample: str | None = None, exaggeration: float = 0.5,
         cfg_weight: float = 0.5, temperature: float = 0.8,
-        tts_model: str = "chatterbox",
+        tts_model: str = "chatterbox", seed: int = 0,
     ) -> dict[str, Any]:
         return self._post("/api/project/generate-chunk-audio", {
             "text_file_id": text_file_id,
@@ -120,6 +120,7 @@ class HentyClient:
             "cfg_weight": cfg_weight,
             "temperature": temperature,
             "tts_model": tts_model,
+            "seed": seed,
         })
 
     def transcribe_take(
@@ -143,6 +144,23 @@ class HentyClient:
         return self._post("/api/project/stitch-best-takes", {"chapter_id": chapter_id})
 
 
+def is_available(
+    timeout: float = 3.0,
+    base_url: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """True if Henty answers on /api/status (public, no auth). Used to gate the
+    worker so jobs wait in `approved` while the GPU box is off instead of failing."""
+    base = (base_url or henty_base_url()).rstrip("/")
+    if not base:
+        return False
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as c:
+            return c.get(f"{base}/api/status").status_code == 200
+    except Exception:
+        return False
+
+
 # --- ASR feedback loop ------------------------------------------------------
 
 @dataclass
@@ -154,6 +172,7 @@ class ChunkResult:
     truncated: bool
     audio_file: str | None
     ok: bool                   # met threshold and not truncated
+    seed: int = 0              # seed that produced the best take (reproducible)
 
 
 def _norm_similarity(raw: Any) -> float:
@@ -190,15 +209,19 @@ def synthesize_chunk_with_retries(
     best_sim = 0.0
     best_file: str | None = None
     best_trunc = True
+    best_seed = 0
     best_key = (-1, -1.0)  # (non_truncated_flag, similarity): non-truncated wins ties
     attempts = 0
     while attempts <= max_retries:
         attempts += 1
-        # Nudge temperature up on retries (effective once Henty forwards it).
+        # Deterministic, non-zero seed per attempt (Henty now forwards it): retries
+        # genuinely differ and the winning take is reproducible. Nudge temperature too.
+        seed = attempts
         temperature = min(0.8 + 0.1 * (attempts - 1), 1.2)
         gen = client.generate_chunk(
             text_file_id, chunk_id, chunk_text,
             voice_sample=voice_sample, temperature=temperature, tts_model=tts_model,
+            seed=seed,
         )
         audio_file = gen.get("audio_file")
         if not audio_file:
@@ -208,7 +231,8 @@ def synthesize_chunk_with_retries(
         sim = _norm_similarity(tr.get("similarity_score"))
         key = (0 if truncated else 1, sim)
         if key > best_key:
-            best_key, best_sim, best_file, best_trunc = key, sim, audio_file, truncated
+            best_key, best_sim, best_file, best_trunc, best_seed = (
+                key, sim, audio_file, truncated, seed)
         if sim >= threshold and not truncated:
             break
 
@@ -219,7 +243,7 @@ def synthesize_chunk_with_retries(
         log.warning("chunk %s/%s best similarity %.3f after %d tries (truncated=%s)",
                     text_file_id, chunk_id, best_sim, attempts, best_trunc)
     return ChunkResult(text_file_id, chunk_id, round(max(best_sim, 0.0), 3),
-                       attempts, best_trunc, best_file, ok)
+                       attempts, best_trunc, best_file, ok, seed=best_seed)
 
 
 def _iter_chunks(info: dict[str, Any]) -> Iterator[tuple[Any, Any, str]]:
@@ -285,21 +309,23 @@ def write_book_json(slug: str, book: dict[str, Any], books_dir: str | None = Non
     return folder
 
 
-def run_importer(henty_dir: str | None = None) -> tuple[bool, str]:
-    """Run Henty's `batch_import_books.py` to build project.json for the books in
-    BOOKS_DIR. Requires the orchestrator to be co-located with Henty (HENTY_DIR).
-    If not, drop book.json and run the importer manually, then call load_project.
+def run_importer(
+    folder: str | None = None, variant: str = "original", henty_dir: str | None = None,
+) -> tuple[bool, str]:
+    """Run Henty's `batch_import_books.py` to build project.json. With `folder`, imports
+    just that one book (via the merged `--folder` flag); otherwise imports all of
+    BOOKS_DIR. Requires co-location with Henty (HENTY_DIR). Returns (ok, output_tail).
     """
     henty_dir = henty_dir or os.environ.get("HENTY_DIR", "")
     if not henty_dir:
         raise HentyError(
-            "HENTY_DIR not set: run `python batch_import_books.py` on the Henty "
-            "box, then call HentyClient.load_project(<books_dir>/<slug>/project.json)"
+            "HENTY_DIR not set: run `python batch_import_books.py --folder <book dir>` "
+            "on the Henty box, then call HentyClient.load_project(...)"
         )
-    proc = subprocess.run(
-        [sys.executable, "batch_import_books.py"],
-        cwd=henty_dir, capture_output=True, text=True,
-    )
+    cmd = [sys.executable, "batch_import_books.py"]
+    if folder:
+        cmd += ["--folder", str(folder), "--variant", variant]
+    proc = subprocess.run(cmd, cwd=henty_dir, capture_output=True, text=True)
     return proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
 
 

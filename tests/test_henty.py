@@ -32,6 +32,7 @@ class FakeClient:
         self.i = 0
         self.best_set = []
         self.stitched = []
+        self.seeds = []
         self._info = info or {"metadata": {"chapters": []}}
         self._last_sim = 0.0
 
@@ -39,6 +40,7 @@ class FakeClient:
         af, trunc, sim = self.script[self.i]
         self.i += 1
         self._last_sim = sim
+        self.seeds.append(kw.get("seed"))
         # real Henty shape: possibly_truncated is nested in chunk.generated_audios
         return {"success": True, "audio_file": af, "audio_url": f"/api/audio/{af}",
                 "chunk": {"generated_audios": [{"audio_file": af, "possibly_truncated": trunc}]}}
@@ -64,6 +66,15 @@ def test_loop_stops_when_threshold_met():
     assert res.attempts == 2 and res.ok
     assert res.similarity == 0.9
     assert c.best_set == [("ch0", 1, "a2.wav")]  # best (and only good) take set
+    assert c.seeds == [1, 2]                     # deterministic, non-zero per attempt
+    assert res.seed == 2                          # winning take's seed recorded
+
+
+def test_loop_uses_increasing_deterministic_seeds():
+    c = FakeClient([("a1.wav", False, 60), ("a2.wav", False, 70), ("a3.wav", False, 65)])
+    res = synthesize_chunk_with_retries(c, "ch0", 9, "hi", threshold=0.99, max_retries=2)
+    assert c.seeds == [1, 2, 3]
+    assert res.seed == 2  # highest-scoring take (a2, seed 2) is kept and reproducible
 
 
 def test_loop_keeps_best_when_never_meets_threshold():
@@ -112,10 +123,21 @@ def test_http_client_sends_key_and_payload():
 
     client = HentyClient(base_url="http://henty.test", api_key="secret",
                          transport=httpx.MockTransport(handler))
-    out = client.generate_chunk("ch0", 1, "hello", voice_sample="Haggard")
+    out = client.generate_chunk("ch0", 1, "hello", voice_sample="Haggard", seed=7)
     assert out["audio_file"] == "x.wav"
     assert seen["path"] == "/api/project/generate-chunk-audio"
     assert seen["key"] == "secret"
     assert seen["body"]["chunk_text"] == "hello"
     assert seen["body"]["voice_sample"] == "Haggard"
+    assert seen["body"]["seed"] == 7
     client.close()
+
+
+def test_is_available():
+    def boom(_r):
+        raise httpx.ConnectError("refused")
+    ok = httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True}))
+    down = httpx.MockTransport(lambda r: httpx.Response(503))
+    assert henty.is_available(base_url="http://henty.test", transport=ok) is True
+    assert henty.is_available(base_url="http://henty.test", transport=down) is False
+    assert henty.is_available(base_url="http://henty.test", transport=httpx.MockTransport(boom)) is False
