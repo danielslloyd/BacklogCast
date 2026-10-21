@@ -272,7 +272,13 @@ def approve(slug: str) -> dict[str, Any]:
 def retry(slug: str) -> dict[str, Any]:
     if not articles.meta_path(slug).exists():
         raise HTTPException(404, "not found")
-    articles.set_state(slug, "approved", error=None, approved_at=articles.utcnow_iso())
+    # A manual retry gets a fresh set of automatic attempts; no text yet means
+    # extraction is what failed.
+    reset = dict(error=None, retry_after=None, extract_attempts=0, synth_attempts=0)
+    if articles.load_body(slug).strip():
+        articles.set_state(slug, "approved", approved_at=articles.utcnow_iso(), **reset)
+    else:
+        articles.set_state(slug, "queued", **reset)
     tts.worker.kick()
     return _article_payload(slug)
 

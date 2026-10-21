@@ -53,8 +53,13 @@ def test_synthesize_without_henty_fails_gracefully():
                                 raw_html=None, extraction_method="manual", state="approved")
     tts.synthesize(meta["slug"])
     m = articles.load_meta(meta["slug"])
-    assert m["state"] == "failed"
+    # First failure: back to approved, waiting out the backoff.
+    assert m["state"] == "approved" and m["retry_after"] and not tts.due(m)
     assert "HENTY_BOOKS_DIR" in (m["error"] or "")
+    for _ in range(tts.MAX_ATTEMPTS - 1):
+        tts.synthesize(meta["slug"])
+    m = articles.load_meta(meta["slug"])
+    assert m["state"] == "failed" and m["synth_attempts"] == tts.MAX_ATTEMPTS
 
 
 def test_fetch_stitched_uses_henty_audio_path(tmp_path):
@@ -64,3 +69,31 @@ def test_fetch_stitched_uses_henty_audio_path(tmp_path):
     st = {"success": True, "audio_file": wav.name,
           "audio_url": f"/api/project/audio/{wav.name}", "audio_path": str(wav)}
     assert tts._fetch_stitched(None, st, str(tmp_path / "td")) == wav
+
+
+def test_extract_retries_claude_failure_then_keeps_draft(monkeypatch):
+    from app import claude_extract
+    monkeypatch.setenv("CLAUDE_EXTRACT", "always")
+    monkeypatch.setattr(extractor, "fetch", lambda url, **k: extractor.Fetched(
+        "html", b"<html/>", url, "<html/>"))
+    monkeypatch.setattr(extractor, "extract", lambda html, url=None: {
+        "body": "Draft text here. " * 20, "title": "T", "author": "",
+        "method": "trafilatura", "confidence_low": False})
+
+    def limited(*a, **k):
+        raise claude_extract.ClaudeExtractError("session limit")
+    monkeypatch.setattr(claude_extract, "clean_with_claude", limited)
+    meta = articles.new_article(title="T", source_url="http://x/r", body="",
+                                raw_html=None, extraction_method="lloydio-queue", state="queued")
+    slug = meta["slug"]
+    articles.set_state(slug, "queued", narrate=False)
+    tts.process_queued(slug)
+    m = articles.load_meta(slug)
+    assert m["state"] == "queued" and m["extract_attempts"] == 1 and not tts.due(m)
+    assert not articles.load_body(slug).strip()
+
+    # Last attempt: the automatic draft is kept, so the link still gets text.
+    articles.set_state(slug, "queued", extract_attempts=tts.MAX_ATTEMPTS - 1, retry_after=None)
+    tts.process_queued(slug)
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and "Draft text" in articles.load_body(slug)

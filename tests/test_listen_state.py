@@ -26,7 +26,10 @@ def _status_server(states, calls):
             return httpx.Response(200, json={"ok": True, "slug": slug})
         if req.method == "POST":
             body = json.loads(req.content)
-            calls.append((body["slug"], body["state"]))
+            if "text" in body:
+                calls.append(("text", body["slug"], body["text"]))
+            else:
+                calls.append((body["slug"], body["state"]))
             return httpx.Response(200, json={"ok": True})
         slug = req.url.params["slug"]
         return httpx.Response(200, json={"slug": slug, "state": states.get(slug)})
@@ -106,7 +109,9 @@ def test_text_only_job_skips_narration(monkeypatch):
     tts.process_queued(slug)
     m = articles.load_meta(slug)
     assert m["state"] == "text_ready" and m["lloydio_text_published_at"]
-    assert calls == [("episode", "t-abc")]  # no in_progress for text-only work
+    # Text progress is reported; no narration in_progress for text-only work.
+    assert calls == [("text", "t-abc", "in_progress"), ("text", "t-abc", "clear"),
+                     ("episode", "t-abc")]
 
 
 def _queue(*items, generated="2026-10-21T13:00:00.000Z"):

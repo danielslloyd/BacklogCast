@@ -22,6 +22,7 @@ import threading
 import time
 import wave
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mutagen import File as MutagenFile
@@ -84,6 +85,53 @@ def _measure_duration_seconds(path: Path) -> int:
     return 0
 
 
+# --- bounded retries ---------------------------------------------------------
+#
+# A failed extraction or narration goes back to its waiting state with a
+# `retry_after` time, up to MAX_ATTEMPTS tries per stage; then it stays failed
+# (a human can still retry it from the UI). The backoff is long enough to ride
+# out a Claude session limit (resets within ~5h).
+
+MAX_ATTEMPTS = 4
+RETRY_DELAYS = (15 * 60, 60 * 60, 4 * 60 * 60)  # before attempts 2, 3, 4
+
+
+class PermanentError(RuntimeError):
+    """A failure retrying won't fix (e.g. the page isn't an article)."""
+
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def due(meta: dict) -> bool:
+    """False while a job is waiting out its retry backoff."""
+    ra = meta.get("retry_after")
+    return not ra or ra <= articles.utcnow_iso()
+
+
+def attempt_no(meta: dict, stage: str) -> int:
+    """1-based number of the attempt about to run for `stage` (extract|synth)."""
+    return int(meta.get(f"{stage}_attempts") or 0) + 1
+
+
+def _retry_or_fail(slug: str, stage: str, error: str, retry_state: str,
+                   permanent: bool = False) -> str | None:
+    """Record a failed attempt. Returns the retry time if another attempt is
+    scheduled (job back in `retry_state`), else None (job is `failed`)."""
+    n = attempt_no(articles.load_meta(slug), stage)
+    if permanent or n >= MAX_ATTEMPTS:
+        articles.set_state(slug, "failed", error=error, retry_after=None,
+                           **{f"{stage}_attempts": n})
+        return None
+    when = _iso(datetime.now(timezone.utc) + timedelta(seconds=RETRY_DELAYS[n - 1]))
+    articles.set_state(slug, retry_state, error=error, retry_after=when,
+                       **{f"{stage}_attempts": n})
+    log.info("%s of %s failed (attempt %d/%d); retrying after %s",
+             stage, slug, n, MAX_ATTEMPTS, when)
+    return when
+
+
 # --- Stage B: fetch + extract + build book.json -----------------------------
 
 def _h1_title(md: str) -> str:
@@ -95,11 +143,15 @@ def _h1_title(md: str) -> str:
     return ""
 
 
-def extract_source(slug: str) -> str | None:
+def extract_source(slug: str, last_try: bool = True) -> str | None:
     """Fetch the job's URL (reusing a saved raw.html / source.pdf), draft it
     with trafilatura, then run the Claude cleanup per CLAUDE_EXTRACT. Saves the
     result as the article body. Returns a review reason when a human should
-    look before synthesis, else None."""
+    look before synthesis, else None.
+
+    A failed Claude cleanup raises (so the job is retried) unless `last_try`,
+    when the automatic draft is kept instead. Raises PermanentError when Claude
+    says the page isn't an article."""
     meta = articles.load_meta(slug)
     url = meta.get("source_url")
     raw, pdf = articles.raw_html_path(slug), articles.source_pdf_path(slug)
@@ -128,7 +180,7 @@ def extract_source(slug: str) -> str | None:
         try:
             cr = claude_extract.clean_with_claude(src, kind, draft)
             if cr.verdict == "not_article":
-                review = f"Claude: not an article ({cr.reason})"
+                raise PermanentError(f"not an article ({cr.reason})")
             else:
                 body, method = cr.markdown, "claude"
                 title = _h1_title(body) or title
@@ -137,25 +189,27 @@ def extract_source(slug: str) -> str | None:
                     log.warning("claude cleanup for %s looks off: %s", slug, cr.reason)
         except claude_extract.ClaudeExtractError as e:
             log.warning("claude cleanup failed for %s: %s", slug, e)
-            if not draft.strip():
+            if not draft.strip() or not last_try:
                 raise
             review = f"Claude cleanup failed ({e}); automatic draft kept"
 
     if not body.strip():
+        # Likely a block/interstitial page: drop it so a retry fetches afresh.
+        src.unlink(missing_ok=True)
         raise RuntimeError(f"no text extracted from {kind}")
     articles.update_article_text(slug, title=title, author=author, body=body)
     articles.set_state(slug, "extracting", extraction_method=method)
     return review
 
 
-def build_book(slug: str) -> dict:
+def build_book(slug: str, last_try: bool = True) -> dict:
     """Extract (if the body is still empty), build Henty book.json, and
     persist it (to HENTY_BOOKS_DIR/<slug>/ when configured, else the article
     dir). Advances state to book_built (or needs_review when flagged)."""
     meta = articles.load_meta(slug)
     review = None
     if not articles.load_body(slug).strip() and meta.get("source_url"):
-        review = extract_source(slug)
+        review = extract_source(slug, last_try=last_try)
         meta = articles.load_meta(slug)
     body = articles.load_body(slug)
 
@@ -203,7 +257,8 @@ def _send_text(slug: str) -> None:
 
 def process_queued(slug: str) -> None:
     """Extract clean text. Narration jobs then go on to Henty (approved);
-    text-only jobs are done once their text is on lloydio (text_ready)."""
+    text-only jobs are done once their text is on lloydio (text_ready).
+    Failures are retried with backoff (see _retry_or_fail)."""
     meta = articles.load_meta(slug)
     lslug = meta.get("lloydio_slug")
     narrate = lloydio.narrating(meta)
@@ -212,25 +267,32 @@ def process_queued(slug: str) -> None:
                            narrate_changed_at=articles.utcnow_iso())
         lloydio.report_status(lslug, "clear")
         narrate = False
+    last_try = attempt_no(meta, "extract") >= MAX_ATTEMPTS
     articles.set_state(slug, "extracting", error=None)
+    lloydio.report_text_status(lslug, "in_progress")
     if narrate:
         lloydio.report_status(lslug, "in_progress")
     try:
-        build_book(slug)
-        meta = articles.load_meta(slug)
-        if meta.get("state") == "needs_review":
-            if narrate:
-                lloydio.report_status(lslug, "failed")
-        elif not narrate:
-            articles.set_state(slug, "text_ready")
-            _send_text(slug)
-        elif meta.get("state") == "book_built" and config.load_config().get("auto_approve", True):
-            articles.set_state(slug, "approved", approved_at=articles.utcnow_iso())
+        build_book(slug, last_try=last_try)
     except Exception as e:
         log.exception("extract/build failed for %s", slug)
-        articles.set_state(slug, "failed", error=f"extract: {e}")
+        err = f"extract: {e}"
+        retry = _retry_or_fail(slug, "extract", err, "queued",
+                               permanent=isinstance(e, PermanentError))
+        lloydio.report_text_status(lslug, "waiting" if retry else "failed", err)
         if narrate:
-            lloydio.report_status(lslug, "failed")
+            lloydio.report_status(lslug, "clear" if retry else "failed")
+        return
+    meta = articles.set_state(slug, articles.load_meta(slug)["state"], retry_after=None)
+    lloydio.report_text_status(lslug, "clear")
+    if not narrate:
+        # Text-only: a flagged draft is still better than no md link.
+        articles.set_state(slug, "text_ready")
+        _send_text(slug)
+    elif meta.get("state") == "needs_review":
+        lloydio.report_status(lslug, "failed")
+    elif meta.get("state") == "book_built" and config.load_config().get("auto_approve", True):
+        articles.set_state(slug, "approved", approved_at=articles.utcnow_iso())
 
 
 # --- Stage C + D: Henty synthesis + local episode assembly ------------------
@@ -328,8 +390,9 @@ def synthesize(slug: str) -> None:
         _stop_narrating(slug, lslug)
     except Exception as e:
         log.exception("synthesis failed for %s", slug)
-        articles.set_state(slug, "failed", error=str(e))
-        lloydio.report_status(lslug, "failed")
+        retry = _retry_or_fail(slug, "synth", str(e), "approved")
+        # A scheduled retry reads as plain "queued" on /reading meanwhile.
+        lloydio.report_status(lslug, "clear" if retry else "failed")
 
 
 # --- background worker ------------------------------------------------------
@@ -366,12 +429,12 @@ class TTSWorker:
                     self._last_writeback = time.monotonic()
                     lloydio.publish_pending()
                 # Text first: every pending extraction runs before any narration.
-                queued = sorted(articles.iter_articles(state="queued"),
+                queued = sorted((m for m in articles.iter_articles(state="queued") if due(m)),
                                 key=lambda m: m.get("fetched_at") or "")
                 if queued:
                     process_queued(queued[0]["slug"])
                     continue
-                approved = sorted(articles.iter_articles(state="approved"),
+                approved = sorted((m for m in articles.iter_articles(state="approved") if due(m)),
                                   key=lambda m: m.get("approved_at") or "")
                 # Only synthesize when Henty (GPU) is up; else jobs wait in `approved`.
                 if approved and henty.is_available():

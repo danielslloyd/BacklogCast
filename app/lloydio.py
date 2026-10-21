@@ -165,6 +165,7 @@ def _update(meta: dict[str, Any], item: dict[str, Any], needs_audio: bool) -> bo
         # Queued for listening (again): narrate, keeping any extracted text.
         nxt = "approved" if state in ("text_ready", "book_built") else state
         articles.set_state(slug, nxt, narrate=True, lloydio_slug=lslug, error=None,
+                           synth_attempts=0, retry_after=None,
                            narrate_changed_at=articles.utcnow_iso(),
                            approved_at=articles.utcnow_iso())
         _cancel_checked.pop(lslug, None)
@@ -215,6 +216,27 @@ def report_status(
                    ).raise_for_status()
     except httpx.HTTPError as e:
         log.warning("status report %s=%s failed: %s", lloydio_slug, state, e)
+
+
+def report_text_status(
+    lloydio_slug: str | None, state: str, reason: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> None:
+    """Tell /reading where this link's clean text stands, so a missing "md"
+    link reads as in progress | waiting (retry scheduled) | failed, or `clear`.
+    Best effort, like report_status."""
+    if not lloydio_slug or not _writeback_ready():
+        return
+    body: dict[str, Any] = {"slug": lloydio_slug, "text": state}
+    if reason:
+        body["reason"] = reason[:300]
+    try:
+        with httpx.Client(timeout=15.0, transport=transport) as c:
+            c.post(f"{lloydio_base_url()}{STATUS_PATH}", json=body,
+                   headers={"Authorization": f"Bearer {lloydio_episode_token()}"}
+                   ).raise_for_status()
+    except httpx.HTTPError as e:
+        log.warning("text status report %s=%s failed: %s", lloydio_slug, state, e)
 
 
 def cancel_requested(

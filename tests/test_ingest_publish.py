@@ -144,7 +144,7 @@ def test_worker_routes_pdf_through_claude(monkeypatch):
     assert articles.source_pdf_path(meta["slug"]).exists()
 
 
-def test_worker_flags_not_article_for_review(monkeypatch):
+def test_worker_fails_not_article_without_retry(monkeypatch):
     monkeypatch.setenv("CLAUDE_EXTRACT", "always")
     monkeypatch.setattr(extractor, "fetch", lambda url, **k: extractor.Fetched(
         "html", b"", url, "<html/>"))
@@ -156,7 +156,8 @@ def test_worker_flags_not_article_for_review(monkeypatch):
                                 raw_html=None, extraction_method="pending")
     tts.process_queued(meta["slug"])
     m = articles.load_meta(meta["slug"])
-    assert m["state"] == "needs_review" and "paywall" in m["review_reason"]
+    assert m["state"] == "failed" and "paywall" in m["error"]
+    assert m["extract_attempts"] == 1 and not m["retry_after"]  # permanent: no retry
 
 
 # --- lloydio write-back ----------------------------------------------------
