@@ -5,12 +5,20 @@ poller threads start during the test.
 """
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import paths
 from app.main import app
 
+PW = "test-secret-pw"
 client = TestClient(app)
+client.auth = ("admin", PW)  # /api/* sits behind HTTP Basic auth
+
+
+@pytest.fixture(autouse=True)
+def admin_password(monkeypatch):
+    monkeypatch.setenv("BACKLOGCAST_PASSWORD", PW)
 
 
 def test_config_exposes_new_keys():

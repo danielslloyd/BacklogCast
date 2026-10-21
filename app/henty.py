@@ -289,7 +289,8 @@ def synthesize_project(
             seen_chapters.append(chapter_id)
     for chapter_id in seen_chapters:
         st = client.stitch_chapter(chapter_id)
-        if st.get("stitched_filename") or st.get("stitched_url"):
+        # Henty returns audio_file / audio_url / audio_path for the stitched WAV
+        if st.get("audio_file") or st.get("audio_url") or st.get("audio_path"):
             stitched.append(st)
     return {"reports": reports, "stitched": stitched}
 
@@ -325,10 +326,24 @@ def run_importer(
     cmd = [sys.executable, "batch_import_books.py"]
     if folder:
         cmd += ["--folder", str(folder), "--variant", variant]
-    proc = subprocess.run(cmd, cwd=henty_dir, capture_output=True, text=True)
+    # capture_output pipes the child's stdout, so Python falls back to the
+    # locale encoding (cp1252 on Windows) and the importer's "OK/error" status
+    # lines -- which use U+2713/U+2717 -- raise UnicodeEncodeError. That happens
+    # *after* project.json is written, so a cosmetic print was failing an import
+    # that had actually succeeded. Force UTF-8 on both ends of the pipe.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        cmd, cwd=henty_dir, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env,
+    )
     return proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
 
 
 def project_path_for(slug: str, books_dir: str | None = None) -> str:
+    """Folder to hand to Henty's /api/project/load. Henty joins 'project.json'
+    onto this itself (`os.path.join(project_path, 'project.json')`), so this is
+    the project DIRECTORY, not the file -- passing the file makes Henty look for
+    `<slug>/project.json/project.json` and 400 with "Not a valid project folder".
+    """
     books_dir = books_dir or henty_books_dir()
-    return str(Path(books_dir) / slug / "project.json")
+    return str(Path(books_dir) / slug)

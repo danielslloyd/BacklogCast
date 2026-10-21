@@ -57,7 +57,10 @@ class FakeClient:
 
     def stitch_chapter(self, cid):
         self.stitched.append(cid)
-        return {"stitched_filename": f"ch{cid}.wav", "duration_seconds": 5}
+        # mirrors Henty's real stitch-best-takes response shape
+        return {"success": True, "audio_file": f"ch{cid}.wav",
+                "audio_url": f"/api/project/audio/ch{cid}.wav",
+                "audio_path": f"/books/x/audio/ch{cid}.wav"}
 
 
 def test_loop_stops_when_threshold_met():

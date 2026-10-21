@@ -54,3 +54,12 @@ def test_synthesize_without_henty_fails_gracefully():
     m = articles.load_meta(meta["slug"])
     assert m["state"] == "failed"
     assert "HENTY_BOOKS_DIR" in (m["error"] or "")
+
+
+def test_fetch_stitched_uses_henty_audio_path(tmp_path):
+    # Henty's stitch-best-takes returns audio_path/audio_file/audio_url
+    wav = tmp_path / "E2E_stitched_1.wav"
+    wav.write_bytes(b"RIFF")
+    st = {"success": True, "audio_file": wav.name,
+          "audio_url": f"/api/project/audio/{wav.name}", "audio_path": str(wav)}
+    assert tts._fetch_stitched(None, st, str(tmp_path / "td")) == wav
