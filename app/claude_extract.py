@@ -15,7 +15,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
@@ -52,7 +52,14 @@ If the document is NOT readable material — a paywall or login wall showing
 only a teaser, an error page, a listing/index page — write `clean.md` with a
 single line `NOT_ARTICLE: <short reason>` instead.
 
-Write `clean.md` once with the Write tool, then reply with one short sentence.
+Also write `meta.json` in this folder with what the document itself states
+about the piece (use "" for anything it doesn't say — never guess):
+
+    {{"author": "<author name(s)>", "publication": "<publication, site or journal name>",
+     "date": "<publication date as YYYY-MM-DD, or YYYY-MM / YYYY if that's all it gives>"}}
+
+Write `clean.md` and `meta.json` once each with the Write tool, then reply with
+one short sentence.
 """
 
 
@@ -62,6 +69,7 @@ class ClaudeResult:
     verdict: str          # "ok" | "not_article" | "suspect"
     reason: str = ""
     cost_usd: float = 0.0
+    meta: dict[str, str] = field(default_factory=dict)  # author/publication/date
 
 
 class ClaudeExtractError(RuntimeError):
@@ -128,15 +136,27 @@ def clean_with_claude(
         else:
             raise ClaudeExtractError(f"claude did not write clean.md: {reply[:300]}")
         md = clean.read_text(encoding="utf-8").strip()
+        meta = _read_meta(work / "meta.json")
 
     if not md:
         raise ClaudeExtractError("clean.md is empty")
     if md.startswith(NOT_ARTICLE):
-        return ClaudeResult(md, "not_article", md.split(":", 1)[-1].strip(), cost)
+        return ClaudeResult(md, "not_article", md.split(":", 1)[-1].strip(), cost, meta)
     verdict, reason = "ok", ""
     if kind == "html" and len(draft_md.strip()) > 1500:
         ratio = len(md) / len(draft_md.strip())
         if ratio < 0.4 or ratio > 1.5:
             verdict, reason = "suspect", f"length {ratio:.0%} of the automatic draft"
     log.info("claude cleanup: %d chars, verdict=%s, $%.3f", len(md), verdict, cost)
-    return ClaudeResult(md + "\n", verdict, reason, cost)
+    return ClaudeResult(md + "\n", verdict, reason, cost, meta)
+
+
+def _read_meta(path: Path) -> dict[str, str]:
+    """meta.json as {author, publication, date} strings; {} if missing/bad."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: str(data.get(k) or "").strip()[:200] for k in ("author", "publication", "date")}

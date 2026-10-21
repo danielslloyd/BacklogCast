@@ -97,3 +97,32 @@ def test_extract_retries_claude_failure_then_keeps_draft(monkeypatch):
     tts.process_queued(slug)
     m = articles.load_meta(slug)
     assert m["state"] == "text_ready" and "Draft text" in articles.load_body(slug)
+
+
+def test_book_opens_with_byline_intro(monkeypatch):
+    from app import bookjson
+    meta = {"title": "The Piece", "author": "A. Writer", "publication": "The Review",
+            "published": "2024-03-05"}
+    book = bookjson.build("# The Piece\n\nBody text here.\n", title="The Piece",
+                          intro=lambda spoken: tts.intro_text(meta, spoken))
+    assert book["blocks"][0] == {"type": "heading", "text": "The Piece"}
+    assert book["blocks"][1]["text"] == "By A. Writer. Published in The Review, March 5, 2024."
+    # No heading that says the title: the intro says it.
+    book = bookjson.build("Body text here.\n", title="",
+                          intro=lambda spoken: tts.intro_text(meta, spoken))
+    assert book["blocks"][0]["text"].startswith("The Piece. By A. Writer.")
+
+
+def test_extract_records_publication_and_date(monkeypatch):
+    monkeypatch.setenv("CLAUDE_EXTRACT", "off")
+    monkeypatch.setattr(extractor, "fetch", lambda url, **k: extractor.Fetched(
+        "html", b"<html/>", url, "<html/>"))
+    monkeypatch.setattr(extractor, "extract", lambda html, url=None: {
+        "body": "# T\n\n" + "Body. " * 100, "title": "T", "author": "Ann",
+        "publication": "", "published": "2023-01-02",
+        "method": "trafilatura", "confidence_low": False})
+    meta = articles.new_article(title="T", source_url="https://www.example.com/a", body="",
+                                raw_html=None, extraction_method="lloydio-queue", state="queued")
+    tts.process_queued(meta["slug"])
+    m = articles.load_meta(meta["slug"])
+    assert (m["author"], m["publication"], m["published"]) == ("Ann", "example.com", "2023-01-02")

@@ -12,7 +12,7 @@ sentence boundaries, with all markdown stripped (see app.extractor).
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .extractor import sanitize_inline, strip_block_marker
 
@@ -70,8 +70,11 @@ def chunk_text(text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks
 
 
-def build(md: str, title: str = "", limit: int = MAX_CHUNK_CHARS) -> dict[str, Any]:
-    """Parse cleaned/markdown article text into a Henty 'blocks' book.json dict."""
+def build(md: str, title: str = "", limit: int = MAX_CHUNK_CHARS,
+          intro: Callable[[bool], str] | None = None) -> dict[str, Any]:
+    """Parse cleaned/markdown article text into a Henty 'blocks' book.json dict.
+    `intro(title_spoken)` gives a byline paragraph to read first (after the
+    opening heading); title_spoken says whether that heading is the title."""
     blocks: list[dict[str, Any]] = []
     para_lines: list[str] = []
     in_fence = False
@@ -110,6 +113,13 @@ def build(md: str, title: str = "", limit: int = MAX_CHUNK_CHARS) -> dict[str, A
     # the article title so Henty doesn't dump everything into "Front Matter".
     if title and not any(b["type"] == "heading" for b in blocks):
         blocks.insert(0, {"type": "heading", "text": sanitize_inline(title)})
+
+    if intro:
+        lead = blocks[0] if blocks and blocks[0]["type"] == "heading" else None
+        spoken = bool(lead and title and lead["text"].strip().lower() == sanitize_inline(title).strip().lower())
+        text = sanitize_inline(intro(spoken))
+        if text:
+            blocks.insert(1 if lead else 0, {"type": "para", "text": text})
 
     return {"title": title or "Untitled", "blocks": blocks}
 

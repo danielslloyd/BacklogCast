@@ -22,6 +22,7 @@ import threading
 import time
 import wave
 from dataclasses import asdict
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -169,10 +170,12 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
             kind, src = "html", raw
 
     title, author, draft, method, low = meta.get("title") or "", "", "", "pdf", True
+    publication, published = "", ""
     if kind == "html":
         result = extractor.extract(src.read_text(encoding="utf-8"), url=url)
         draft, method, low = result["body"], result["method"], result["confidence_low"]
         title, author = result["title"] or title, result["author"]
+        publication, published = result.get("publication", ""), result.get("published", "")
 
     body, review = draft, ("low-confidence extraction" if low else None)
     mode = config.claude_extract_mode()
@@ -184,6 +187,10 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
             else:
                 body, method = cr.markdown, "claude"
                 title = _h1_title(body) or title
+                # Claude read the actual document: its byline facts win.
+                author = cr.meta.get("author") or author
+                publication = cr.meta.get("publication") or publication
+                published = cr.meta.get("date") or published
                 review = None
                 if cr.verdict == "suspect":
                     log.warning("claude cleanup for %s looks off: %s", slug, cr.reason)
@@ -198,8 +205,49 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
         src.unlink(missing_ok=True)
         raise RuntimeError(f"no text extracted from {kind}")
     articles.update_article_text(slug, title=title, author=author, body=body)
-    articles.set_state(slug, "extracting", extraction_method=method)
+    articles.set_state(slug, "extracting", extraction_method=method,
+                       publication=publication or _host(url), published=published)
     return review
+
+
+def _host(url: str | None) -> str:
+    host = urlsplit(url or "").hostname or ""
+    return host.removeprefix("www.")
+
+
+_MONTHS = ("January February March April May June July August September "
+           "October November December").split()
+
+
+def _spoken_date(d: str) -> str:
+    """'2024-03-05' -> 'March 5, 2024'; partial dates degrade gracefully."""
+    parts = d.split("-")
+    try:
+        if len(parts) >= 2:
+            month = _MONTHS[int(parts[1]) - 1]
+            return f"{month} {int(parts[2])}, {parts[0]}" if len(parts) == 3 else f"{month} {parts[0]}"
+    except (ValueError, IndexError):
+        return d
+    return d
+
+
+def intro_text(meta: dict, title_spoken: bool) -> str:
+    """The spoken opening: title (unless a heading already says it), author,
+    publication and date, as far as they're known."""
+    bits = []
+    title = (meta.get("title") or "").strip()
+    if title and not title_spoken and not title.startswith("http"):
+        bits.append(f"{title}.")
+    if meta.get("author"):
+        bits.append(f"By {meta['author']}.")
+    pub, date = meta.get("publication") or "", meta.get("published") or ""
+    if pub and date:
+        bits.append(f"Published in {pub}, {_spoken_date(date)}.")
+    elif pub:
+        bits.append(f"From {pub}.")
+    elif date:
+        bits.append(f"Published {_spoken_date(date)}.")
+    return " ".join(bits)
 
 
 def build_book(slug: str, last_try: bool = True) -> dict:
@@ -213,7 +261,8 @@ def build_book(slug: str, last_try: bool = True) -> dict:
         meta = articles.load_meta(slug)
     body = articles.load_body(slug)
 
-    book = bookjson.build(body, title=meta.get("title") or "")
+    book = bookjson.build(body, title=meta.get("title") or "",
+                          intro=lambda title_spoken: intro_text(meta, title_spoken))
 
     books_dir = config.henty_books_dir()
     if books_dir:

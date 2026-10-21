@@ -289,6 +289,9 @@ def _post_episode(slug: str, with_audio: bool, base_url: str | None,
         "url": meta["source_url"],
         "date": meta.get("published_at") or meta.get("fetched_at") or articles.utcnow_iso(),
         "markdown": articles.load_body(slug),
+        "author": meta.get("author") or "",
+        "source": meta.get("publication") or "",
+        "published": meta.get("published") or "",
     }
     files = None
     if with_audio:

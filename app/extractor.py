@@ -160,6 +160,16 @@ def fetch_url(url: str, timeout: float = 30.0) -> str:
     return f.text
 
 
+def page_metadata(html: str) -> dict[str, str]:
+    """Publication name and publish date (YYYY-MM-DD) from the page's own
+    metadata, where it has them. Empty strings if not found."""
+    meta = trafilatura.extract_metadata(html)
+    if meta is None:
+        return {"publication": "", "published": ""}
+    return {"publication": (meta.sitename or "").strip(),
+            "published": (meta.date or "").strip()[:10]}
+
+
 def _html_to_md_with_trafilatura(html: str, url: str | None) -> tuple[str, str, str]:
     """Returns (markdown_body, title, author). Empty strings if not found."""
     md = trafilatura.extract(
@@ -220,6 +230,7 @@ def extract(html: str, url: str | None = None) -> dict[str, Any]:
         "body": (md or "").strip() + "\n",
         "title": title,
         "author": author,
+        **page_metadata(html),
         "method": method,
         "confidence_low": len((md or "").strip()) < 400,
     }
