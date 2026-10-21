@@ -22,7 +22,7 @@ if not exist "backlogcast.env.bat" (
     pause
     exit /b 1
 )
-call "backlogcast.env.bat"
+call "%~dp0backlogcast.env.bat"
 
 REM --- 2) defaults for anything the env file didn't set ---
 if "%BACKLOGCAST_PORT%"=="" set BACKLOGCAST_PORT=9157
@@ -83,7 +83,7 @@ goto :eof
 curl -s -o nul --max-time 3 %HENTY_BASE_URL%/api/status
 if not errorlevel 1 goto :eof
 echo Starting Henty (GPU) ...
-start "Henty" /d "%HENTY_DIR%" cmd /c start_henty_fresh.bat
+start "Henty" /d "%HENTY_DIR%" cmd /c "%HENTY_DIR%\start_henty_fresh.bat"
 echo Waiting for Henty on %HENTY_BASE_URL% ...
 :wait_henty
 timeout /t 3 /nobreak >nul
