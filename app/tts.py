@@ -2,11 +2,12 @@
 
 The old in-process Chatterbox path is gone. Henty (a separate, GPU-only Flask
 studio) is the sole TTS engine. The background worker advances jobs through the
-pipeline:
+pipeline, always doing text work before narration:
 
-    queued  --extract + build book.json-->  book_built  --(auto)-->  approved
+    queued  --extract + build book.json-->  text_ready      (text-only: text sent to lloydio)
+                                       or->  approved        (narrate=True)
     approved  --Henty generate + ASR loop + stitch + mp3-->  stitched
-    stitched  --(auto)-->  published   (served by the local feed)
+    stitched  --(auto)-->  published   (served by the local feed, sent to lloydio)
 
 Only lloydio (capture) is remote; everything here runs locally next to Henty.
 """
@@ -177,32 +178,59 @@ def build_book(slug: str) -> dict:
     return book
 
 
-def _cancelled(slug: str, lslug: str | None) -> None:
-    """Owner cancelled on lloydio: park the job (re-adding it requeues) and
-    clear the live status so /reading shows it as not queued."""
-    articles.set_state(slug, "cancelled", error=None)
+def _stop_narrating(slug: str, lslug: str | None) -> None:
+    """Owner cancelled or un-queued narration on lloydio. The link stays on the
+    reading list, so keep (or still produce) its clean text: text-only from
+    here, until it's queued for narration again."""
+    has_body = bool(articles.load_body(slug).strip())
+    articles.set_state(slug, "text_ready" if has_body else "queued", error=None,
+                       narrate=False, narrate_changed_at=articles.utcnow_iso())
     lloydio.report_status(lslug, "clear")
-    log.info("cancelled %s from lloydio", slug)
+    log.info("narration of %s cancelled from lloydio", slug)
+    if has_body:
+        _send_text(slug)
+
+
+def _send_text(slug: str) -> None:
+    meta = articles.load_meta(slug)
+    if lloydio.text_publishable(meta) and config.lloydio_episode_token():
+        try:
+            lloydio.publish_text(slug)
+        except Exception:
+            # publish_pending retries it
+            log.exception("lloydio text write-back failed for %s", slug)
 
 
 def process_queued(slug: str) -> None:
-    lslug = articles.load_meta(slug).get("lloydio_slug")
-    if lloydio.cancel_requested(lslug):
-        _cancelled(slug, lslug)
-        return
+    """Extract clean text. Narration jobs then go on to Henty (approved);
+    text-only jobs are done once their text is on lloydio (text_ready)."""
+    meta = articles.load_meta(slug)
+    lslug = meta.get("lloydio_slug")
+    narrate = lloydio.narrating(meta)
+    if narrate and lloydio.cancel_requested(lslug):
+        articles.set_state(slug, "queued", narrate=False,
+                           narrate_changed_at=articles.utcnow_iso())
+        lloydio.report_status(lslug, "clear")
+        narrate = False
     articles.set_state(slug, "extracting", error=None)
-    lloydio.report_status(lslug, "in_progress")
+    if narrate:
+        lloydio.report_status(lslug, "in_progress")
     try:
         build_book(slug)
         meta = articles.load_meta(slug)
-        if meta.get("state") == "book_built" and config.load_config().get("auto_approve", True):
+        if meta.get("state") == "needs_review":
+            if narrate:
+                lloydio.report_status(lslug, "failed")
+        elif not narrate:
+            articles.set_state(slug, "text_ready")
+            _send_text(slug)
+        elif meta.get("state") == "book_built" and config.load_config().get("auto_approve", True):
             articles.set_state(slug, "approved", approved_at=articles.utcnow_iso())
-        elif meta.get("state") == "needs_review":
-            lloydio.report_status(lslug, "failed")
     except Exception as e:
         log.exception("extract/build failed for %s", slug)
         articles.set_state(slug, "failed", error=f"extract: {e}")
-        lloydio.report_status(lslug, "failed")
+        if narrate:
+            lloydio.report_status(lslug, "failed")
 
 
 # --- Stage C + D: Henty synthesis + local episode assembly ------------------
@@ -234,9 +262,10 @@ def _fetch_stitched(client: henty.HentyClient, st: dict, dest_dir: str) -> Path 
 
 def synthesize(slug: str) -> None:
     """Drive Henty for one job: import -> ASR loop per chunk -> stitch -> mp3."""
-    lslug = articles.load_meta(slug).get("lloydio_slug")
-    if lloydio.cancel_requested(lslug):
-        _cancelled(slug, lslug)
+    meta = articles.load_meta(slug)
+    lslug = meta.get("lloydio_slug")
+    if not lloydio.narrating(meta) or lloydio.cancel_requested(lslug):
+        _stop_narrating(slug, lslug)
         return
     articles.set_state(slug, "synthesizing", error=None)
     lloydio.report_status(lslug, "in_progress")
@@ -296,7 +325,7 @@ def synthesize(slug: str) -> None:
                     # stays published locally; publish_pending retries it
                     log.exception("lloydio write-back failed for %s", slug)
     except henty.JobCancelled:
-        _cancelled(slug, lslug)
+        _stop_narrating(slug, lslug)
     except Exception as e:
         log.exception("synthesis failed for %s", slug)
         articles.set_state(slug, "failed", error=str(e))
@@ -333,6 +362,10 @@ class TTSWorker:
         log.info("TTS worker started")
         while not self._stop.is_set():
             try:
+                if time.monotonic() - self._last_writeback > WRITEBACK_RETRY_SECONDS:
+                    self._last_writeback = time.monotonic()
+                    lloydio.publish_pending()
+                # Text first: every pending extraction runs before any narration.
                 queued = sorted(articles.iter_articles(state="queued"),
                                 key=lambda m: m.get("fetched_at") or "")
                 if queued:
@@ -344,9 +377,6 @@ class TTSWorker:
                 if approved and henty.is_available():
                     synthesize(approved[0]["slug"])
                     continue
-                if time.monotonic() - self._last_writeback > WRITEBACK_RETRY_SECONDS:
-                    self._last_writeback = time.monotonic()
-                    lloydio.publish_pending()
             except Exception:
                 log.exception("worker loop error")
             self._tick.wait(timeout=5.0)

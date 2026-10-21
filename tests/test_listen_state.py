@@ -15,9 +15,15 @@ def writeback(monkeypatch):
 
 
 def _status_server(states, calls):
-    """Fake /api/episode-status: GET ?slug= reads `states`, POST records calls."""
+    """Fake lloydio: /api/episode-status GET ?slug= reads `states`, POST records
+    calls; /api/episode records text/audio uploads as ("episode", slug)."""
     def handler(req):
         assert req.headers["authorization"] == "Bearer tok"
+        if req.url.path == "/api/episode":
+            req.read()
+            slug = req.content.split(b'name="slug"\r\n\r\n')[1].split(b"\r\n")[0].decode()
+            calls.append(("episode", slug))
+            return httpx.Response(200, json={"ok": True, "slug": slug})
         if req.method == "POST":
             body = json.loads(req.content)
             calls.append((body["slug"], body["state"]))
@@ -83,41 +89,96 @@ def test_process_queued_reports_progress_then_cancel(monkeypatch):
     assert articles.load_meta(slug)["state"] == "approved"
     assert ("t-abc", "in_progress") in calls
 
+    # Cancel: narration stops, the clean text stays and goes to lloydio.
     states["t-abc"] = "cancelled"
     lloydio._cancel_checked.clear()
     tts.synthesize(slug)
-    assert articles.load_meta(slug)["state"] == "cancelled"
-    assert calls[-1] == ("t-abc", "clear")
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and m["narrate"] is False
+    assert ("t-abc", "clear") in calls and ("episode", "t-abc") in calls
+    assert m["lloydio_text_published_at"]
 
 
-def test_sync_requeues_cancelled_and_reuploads_deleted():
-    cancelled = _job("cancelled")
-    item = {"slug": "t-abc", "url": "https://x/a", "title": "T", "status": "queued", "has_audio": False}
-    q = httpx.MockTransport(lambda r: httpx.Response(200, json={"items": [item]}))
-    res = lloydio.sync(base_url="https://lloyd.test", transport=q)
-    assert res["requeued"] == [cancelled]
-    assert articles.load_meta(cancelled)["state"] == "queued"
+def test_text_only_job_skips_narration(monkeypatch):
+    calls = []
+    _route_httpx(monkeypatch, _status_server({}, calls))
+    slug = _job("queued", narrate=False)
+    tts.process_queued(slug)
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and m["lloydio_text_published_at"]
+    assert calls == [("episode", "t-abc")]  # no in_progress for text-only work
 
-    # Uploaded at 12:00. A queue built at 11:00 is stale (pre-rebuild): no-op.
-    articles.set_state(cancelled, "published", audio_filename="audio.mp3",
-                       lloydio_published_at="2026-10-21T12:00:00Z")
-    stale = httpx.MockTransport(lambda r: httpx.Response(
-        200, json={"generated": "2026-10-21T11:00:00.000Z", "items": [item]}))
+
+def _queue(*items, generated="2026-10-21T13:00:00.000Z"):
+    return httpx.MockTransport(lambda r: httpx.Response(
+        200, json={"version": 2, "generated": generated, "items": list(items)}))
+
+
+def _item(needs_text=False, needs_audio=False):
+    return {"slug": "t-abc", "url": "https://x/a", "title": "T",
+            "needs_text": needs_text, "needs_audio": needs_audio}
+
+
+def test_sync_creates_text_only_and_narration_jobs():
+    a = {**_item(needs_text=True), "url": "https://x/1", "slug": "one"}
+    b = {**_item(needs_text=True, needs_audio=True), "url": "https://x/2", "slug": "two"}
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_queue(a, b))
+    assert len(res["created"]) == 2
+    by_url = {m["source_url"]: m for m in articles.iter_articles()}
+    assert by_url["https://x/1"]["narrate"] is False
+    assert by_url["https://x/2"]["narrate"] is True
+
+
+def test_sync_queue_and_unqueue_respect_queue_age():
+    slug = _job("text_ready", narrate=False, narrate_changed_at="2026-10-21T12:00:00Z")
+    # A listing built before the un-queue is stale: ignored.
+    stale = _queue(_item(needs_audio=True), generated="2026-10-21T11:00:00.000Z")
     assert lloydio.sync(base_url="https://lloyd.test", transport=stale)["requeued"] == []
-    assert articles.load_meta(cancelled)["lloydio_published_at"]
+    # Queued for narration afterwards: narrate, keeping the text.
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_audio=True)))
+    m = articles.load_meta(slug)
+    assert res["requeued"] == [slug] and m["state"] == "approved" and m["narrate"] is True
+    # Un-queued again before narration started, while its text is still
+    # listed as pending (a later listing): text-only. (Once the text exists the
+    # item leaves the queue; then the R2 `cancelled` status un-queues it.)
+    later = _queue(_item(needs_text=True), generated="2026-10-21T23:00:00.000Z")
+    lloydio.sync(base_url="https://lloyd.test", transport=later)
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and m["narrate"] is False
 
-    # A queue built after the upload still listing it = deleted and re-queued.
-    fresh = httpx.MockTransport(lambda r: httpx.Response(
-        200, json={"generated": "2026-10-21T13:00:00.000Z", "items": [item]}))
-    res = lloydio.sync(base_url="https://lloyd.test", transport=fresh)
-    m = articles.load_meta(cancelled)
-    assert res["requeued"] == [cancelled] and m["lloydio_published_at"] is None
+
+def test_unqueue_via_r2_status_stops_before_narration(monkeypatch):
+    calls = []
+    _route_httpx(monkeypatch, _status_server({"t-abc": "cancelled"}, calls))
+    slug = _job("approved", narrate=True)
+    tts.synthesize(slug)
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and m["narrate"] is False
+    assert ("t-abc", "clear") in calls
+
+
+def test_sync_reuploads_deleted_episode_only_after_rebuild():
+    slug = _job("published", audio_filename="audio.mp3",
+                lloydio_published_at="2026-10-21T12:00:00Z")
+    stale = _queue(_item(needs_audio=True), generated="2026-10-21T11:00:00.000Z")
+    assert lloydio.sync(base_url="https://lloyd.test", transport=stale)["requeued"] == []
+    assert articles.load_meta(slug)["lloydio_published_at"]
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_audio=True)))
+    m = articles.load_meta(slug)
+    assert res["requeued"] == [slug] and m["lloydio_published_at"] is None
     assert lloydio.publishable(m)
+
+
+def test_sync_moves_legacy_cancelled_to_text_ready():
+    slug = _job("cancelled")
+    lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_text=False)))
+    # Not listed for text or audio -> skipped; listed for text -> migrated.
+    lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_text=True)))
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and m["narrate"] is False
 
 
 def test_sync_leaves_failed_jobs_alone():
     _job("failed")
-    item = {"slug": "t-abc", "url": "https://x/a", "status": "queued", "has_audio": False}
-    q = httpx.MockTransport(lambda r: httpx.Response(200, json={"items": [item]}))
-    res = lloydio.sync(base_url="https://lloyd.test", transport=q)
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_audio=True)))
     assert res["requeued"] == [] and res["skipped"] == ["https://x/a"]

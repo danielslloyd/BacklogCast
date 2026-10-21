@@ -58,14 +58,20 @@ def fetch_queue(
     return [{**it, "_generated": generated} for it in items if isinstance(it, dict)]
 
 
-def needs_narration(item: dict[str, Any]) -> bool:
-    """True if this queue item should be narrated (has a URL, no audio yet)."""
+def wants(item: dict[str, Any]) -> tuple[bool, bool]:
+    """(needs_text, needs_audio) for a queue item. Queue v2 says so directly;
+    a v1 queue only listed narration work."""
     if not item.get("url"):
-        return False
-    if item.get("has_audio"):
-        return False
-    status = (item.get("status") or "queued").lower()
-    return status == "queued" or not item.get("has_audio")
+        return False, False
+    if "needs_text" in item or "needs_audio" in item:
+        return bool(item.get("needs_text")), bool(item.get("needs_audio"))
+    narrated = bool(item.get("has_audio"))
+    return not (item.get("article_exists") or narrated), not narrated
+
+
+def needs_narration(item: dict[str, Any]) -> bool:
+    """True if this queue item should be narrated."""
+    return wants(item)[1]
 
 
 def sync(
@@ -73,25 +79,29 @@ def sync(
     create: bool = True,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, list[str]]:
-    """Poll the queue and create local jobs for new items.
+    """Poll the queue and create or update local jobs.
+
+    Every listed link gets a job, so its clean text is produced; only those
+    with needs_audio are narrated (`narrate` on the job). Existing jobs follow
+    the owner's queue/un-queue changes, judged against the queue's build time
+    so a listing that hasn't caught up with a rebuild is ignored.
 
     Returns {"created": [slugs], "requeued": [slugs], "skipped": [urls]}.
-    Deduped by source_url so re-polling is idempotent. An item that is back in
-    the queue after the owner cancelled it resumes; one whose episode was
-    deleted on lloydio gets its existing audio re-uploaded (publish_pending).
-    `create=False` does a dry run.
+    Deduped by source_url so re-polling is idempotent. `create=False` does a
+    dry run.
     """
     created: list[str] = []
     requeued: list[str] = []
     skipped: list[str] = []
     for item in fetch_queue(base_url, transport=transport):
         url = item.get("url") or ""
-        if not needs_narration(item):
+        needs_text, needs_audio = wants(item)
+        if not (needs_text or needs_audio):
             skipped.append(url or item.get("slug") or "?")
             continue
         existing = articles.find_by_source_url(url)
         if existing:
-            if create and _revive(existing, item):
+            if create and _update(existing, item, needs_audio):
                 requeued.append(existing["slug"])
             else:
                 skipped.append(url)
@@ -113,10 +123,12 @@ def sync(
             "queued",
             lloydio_slug=item.get("slug"),
             tags=item.get("tags") or [],
+            narrate=needs_audio,
         )
         created.append(meta["slug"])
-        log.info("queued from lloydio: %s (%s)", meta["slug"], url)
-    log.info("lloydio sync: +%d new, %d requeued, %d skipped",
+        log.info("queued from lloydio: %s (%s)%s", meta["slug"], url,
+                 " for narration" if needs_audio else "")
+    log.info("lloydio sync: +%d new, %d updated, %d skipped",
              len(created), len(requeued), len(skipped))
     return {"created": created, "requeued": requeued, "skipped": skipped}
 
@@ -125,27 +137,56 @@ def _ts(iso: str) -> datetime:
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
-def _revive(meta: dict[str, Any], item: dict[str, Any]) -> bool:
-    """Re-activate a local job whose URL is queued again on lloydio."""
-    slug, lslug = meta["slug"], item.get("slug") or meta.get("lloydio_slug")
-    if meta.get("state") == "cancelled":
-        # Keep any extracted text: an empty body re-extracts, a full one just
-        # rebuilds book.json.
-        articles.set_state(slug, "queued", error=None, lloydio_slug=lslug)
-        _cancel_checked.pop(lslug, None)
-        log.info("requeued %s (re-added after cancel)", slug)
+def _newer(item: dict[str, Any], than: str | None) -> bool:
+    """Was this queue listing built after `than`? (True if `than` is unset.)"""
+    if not than:
         return True
+    return bool(item.get("_generated")) and _ts(item["_generated"]) > _ts(than)
+
+
+def narrating(meta: dict[str, Any]) -> bool:
+    # Jobs from before text-only processing existed were all narration jobs.
+    return bool(meta.get("narrate", True))
+
+
+def _update(meta: dict[str, Any], item: dict[str, Any], needs_audio: bool) -> bool:
+    """Bring an existing job in line with the queue. Returns True if changed."""
+    slug, lslug = meta["slug"], item.get("slug") or meta.get("lloydio_slug")
+    state, has_body = meta.get("state"), bool(articles.load_body(slug).strip())
+
+    if state == "cancelled":
+        # Older cancel state: park as text-only (re-queuing below can lift it).
+        state = "text_ready" if has_body else "queued"
+        articles.set_state(slug, state, narrate=False, lloydio_slug=lslug,
+                           narrate_changed_at=meta.get("narrate_changed_at") or articles.utcnow_iso())
+        meta = articles.load_meta(slug)
+
+    if needs_audio and not narrating(meta) and _newer(item, meta.get("narrate_changed_at")):
+        # Queued for listening (again): narrate, keeping any extracted text.
+        nxt = "approved" if state in ("text_ready", "book_built") else state
+        articles.set_state(slug, nxt, narrate=True, lloydio_slug=lslug, error=None,
+                           narrate_changed_at=articles.utcnow_iso(),
+                           approved_at=articles.utcnow_iso())
+        _cancel_checked.pop(lslug, None)
+        log.info("queued %s for narration", slug)
+        return True
+
     uploaded = meta.get("lloydio_published_at")
-    if meta.get("state") == "published" and uploaded:
-        # Only a queue built *after* our upload means it was deleted and queued
-        # again; an older one just hasn't caught up with the rebuild yet.
-        if not item.get("_generated") or _ts(item["_generated"]) <= _ts(uploaded):
-            return False
-        # Deleted on lloydio, then queued again: re-upload the audio we have.
+    if needs_audio and state == "published" and uploaded and _newer(item, uploaded):
+        # Episode deleted on lloydio, then queued again: re-upload our audio.
         articles.set_state(slug, "published", lloydio_published_at=None, lloydio_slug=lslug)
         log.info("will re-upload %s (episode deleted on lloydio, re-queued)", slug)
         return True
-    return False
+
+    if (not needs_audio and narrating(meta) and state in ("queued", "approved", "book_built")
+            and _newer(item, meta.get("narrate_changed_at"))):
+        # Un-queued before narration started: keep it text-only.
+        nxt = "text_ready" if state in ("approved", "book_built") else state
+        articles.set_state(slug, nxt, narrate=False, lloydio_slug=lslug,
+                           narrate_changed_at=articles.utcnow_iso())
+        log.info("un-queued %s from narration", slug)
+        return True
+    return state != meta.get("state")
 
 
 EPISODE_PATH = "/api/episode"
@@ -207,61 +248,98 @@ def publishable(meta: dict[str, Any]) -> bool:
             and bool(meta.get("audio_filename")) and not meta.get("lloydio_published_at"))
 
 
+def text_publishable(meta: dict[str, Any]) -> bool:
+    """Clean text extracted for a text-only job and not yet on lloydio."""
+    return (meta.get("state") == "text_ready" and bool(meta.get("source_url"))
+            and not meta.get("lloydio_text_published_at"))
+
+
+def _post_episode(slug: str, with_audio: bool, base_url: str | None,
+                  timeout: float, transport: httpx.BaseTransport | None) -> dict[str, Any]:
+    meta = articles.load_meta(slug)
+    base = (base_url or lloydio_base_url()).rstrip("/")
+    token = lloydio_episode_token()
+    if not base or not token:
+        raise RuntimeError("LLOYDIO_BASE_URL and LLOYDIO_EPISODE_TOKEN must be set")
+    fields = {
+        "slug": meta.get("lloydio_slug") or slug,
+        "title": meta.get("title") or slug,
+        "url": meta["source_url"],
+        "date": meta.get("published_at") or meta.get("fetched_at") or articles.utcnow_iso(),
+        "markdown": articles.load_body(slug),
+    }
+    files = None
+    if with_audio:
+        audio = article_dir(slug) / meta["audio_filename"]
+        fields["duration_seconds"] = str(meta.get("duration_seconds") or 0)
+        ctype = "audio/mpeg" if audio.suffix == ".mp3" else "audio/wav"
+        # Send the file as bytes so the request has a Content-Length: a chunked
+        # upload reaches the Worker as a stream of unknown length, which R2's
+        # put() rejects (HTTP 500).
+        files = {"audio": (audio.name, audio.read_bytes(), ctype)}
+    else:
+        # Still multipart: the endpoint reads formData either way.
+        files = {"_": ("", b"", "application/octet-stream")}
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as c:
+            r = c.post(f"{base}{EPISODE_PATH}", data=fields, files=files,
+                       headers={"Authorization": f"Bearer {token}"})
+            if r.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{r.status_code} from /api/episode: {r.text[:300]}",
+                    request=r.request, response=r)
+            return r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        articles.set_state(slug, meta["state"], lloydio_error=str(e)[:500])
+        raise
+
+
 def publish_episode(
     slug: str,
     base_url: str | None = None,
     timeout: float = 300.0,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    """Upload one finished episode to lloydio. Records lloydio_published_at on
-    success, or lloydio_error on failure (the job itself stays published)."""
-    meta = articles.load_meta(slug)
-    base = (base_url or lloydio_base_url()).rstrip("/")
-    token = lloydio_episode_token()
-    if not base or not token:
-        raise RuntimeError("LLOYDIO_BASE_URL and LLOYDIO_EPISODE_TOKEN must be set")
-    audio = article_dir(slug) / meta["audio_filename"]
-    fields = {
-        "slug": meta.get("lloydio_slug") or slug,
-        "title": meta.get("title") or slug,
-        "url": meta["source_url"],
-        "date": meta.get("published_at") or articles.utcnow_iso(),
-        "duration_seconds": str(meta.get("duration_seconds") or 0),
-        "markdown": articles.load_body(slug),
-    }
-    ctype = "audio/mpeg" if audio.suffix == ".mp3" else "audio/wav"
-    try:
-        # Send the file as bytes so the request has a Content-Length: a chunked
-        # upload reaches the Worker as a stream of unknown length, which R2's
-        # put() rejects (HTTP 500).
-        with httpx.Client(timeout=timeout, transport=transport) as c:
-            r = c.post(f"{base}{EPISODE_PATH}", data=fields,
-                       files={"audio": (audio.name, audio.read_bytes(), ctype)},
-                       headers={"Authorization": f"Bearer {token}"})
-            if r.status_code >= 400:
-                raise httpx.HTTPStatusError(
-                    f"{r.status_code} from /api/episode: {r.text[:300]}",
-                    request=r.request, response=r)
-            res = r.json()
-    except (httpx.HTTPError, ValueError) as e:
-        articles.set_state(slug, meta["state"], lloydio_error=str(e)[:500])
-        raise
-    articles.set_state(slug, meta["state"], lloydio_published_at=articles.utcnow_iso(),
+    """Upload one finished episode (text + audio) to lloydio. Records
+    lloydio_published_at on success, or lloydio_error on failure (the job
+    itself stays published)."""
+    res = _post_episode(slug, True, base_url, timeout, transport)
+    now = articles.utcnow_iso()
+    state = articles.load_meta(slug)["state"]
+    articles.set_state(slug, state, lloydio_published_at=now, lloydio_text_published_at=now,
                        lloydio_audio_url=res.get("audio_url"), lloydio_error=None)
     log.info("published %s to lloydio (%s)", slug, res.get("audio_url"))
     return res
 
 
+def publish_text(
+    slug: str,
+    base_url: str | None = None,
+    timeout: float = 60.0,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """Upload a text-only job's clean text, giving /reading its "md" link."""
+    res = _post_episode(slug, False, base_url, timeout, transport)
+    state = articles.load_meta(slug)["state"]
+    articles.set_state(slug, state, lloydio_text_published_at=articles.utcnow_iso(),
+                       lloydio_error=None)
+    log.info("published text for %s to lloydio", slug)
+    return res
+
+
 def publish_pending(transport: httpx.BaseTransport | None = None) -> list[str]:
-    """Retry write-back for every published episode not yet on lloydio."""
+    """Retry write-back for every episode or text-only job not yet on lloydio."""
     if not (lloydio_base_url() and lloydio_episode_token()):
         return []
     done: list[str] = []
-    for meta in articles.iter_articles(state="published"):
-        if not publishable(meta):
-            continue
+    for meta in articles.iter_articles():
         try:
-            publish_episode(meta["slug"], transport=transport)
+            if publishable(meta):
+                publish_episode(meta["slug"], transport=transport)
+            elif text_publishable(meta):
+                publish_text(meta["slug"], transport=transport)
+            else:
+                continue
             done.append(meta["slug"])
         except Exception:
             log.exception("lloydio write-back failed for %s", meta["slug"])
