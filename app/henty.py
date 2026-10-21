@@ -38,6 +38,10 @@ class HentyError(RuntimeError):
     pass
 
 
+class JobCancelled(RuntimeError):
+    """The owner cancelled this job on lloydio's /reading page."""
+
+
 # --- markup resolution (mirror Henty's spoken-side of {display|spoken}) ------
 
 _MARKUP_RE = re.compile(r"\{([^}]+)\}")
@@ -270,14 +274,18 @@ def synthesize_project(
     client: HentyClient, *, voice_sample: str | None = None,
     threshold: float | None = None, max_retries: int | None = None,
     progress: Callable[[ChunkResult], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run the ASR loop over every chunk in the loaded project, then stitch each
-    chapter. Returns {"reports": [ChunkResult...], "stitched": [stitch dict...]}."""
+    chapter. Returns {"reports": [ChunkResult...], "stitched": [stitch dict...]}.
+    `should_stop` is checked before each chunk; True raises JobCancelled."""
     info = client.project_info()
     reports: list[ChunkResult] = []
     stitched: list[dict[str, Any]] = []
     seen_chapters: list[Any] = []
     for chapter_id, chunk_id, text in _iter_chunks(info):
+        if should_stop and should_stop():
+            raise JobCancelled("cancelled from lloydio")
         res = synthesize_chunk_with_retries(
             client, chapter_id, chunk_id, text,
             voice_sample=voice_sample, threshold=threshold, max_retries=max_retries,

@@ -23,6 +23,7 @@ STATES = {
     "stitched",      # audio ready locally; awaiting publish
     "published",     # included in the feed
     "failed",        # error; see the `error` field
+    "cancelled",     # owner cancelled it on lloydio's /reading; requeued if re-added
 }
 
 # States from which the article can be (re)published into the feed.

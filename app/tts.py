@@ -177,16 +177,32 @@ def build_book(slug: str) -> dict:
     return book
 
 
+def _cancelled(slug: str, lslug: str | None) -> None:
+    """Owner cancelled on lloydio: park the job (re-adding it requeues) and
+    clear the live status so /reading shows it as not queued."""
+    articles.set_state(slug, "cancelled", error=None)
+    lloydio.report_status(lslug, "clear")
+    log.info("cancelled %s from lloydio", slug)
+
+
 def process_queued(slug: str) -> None:
+    lslug = articles.load_meta(slug).get("lloydio_slug")
+    if lloydio.cancel_requested(lslug):
+        _cancelled(slug, lslug)
+        return
     articles.set_state(slug, "extracting", error=None)
+    lloydio.report_status(lslug, "in_progress")
     try:
         build_book(slug)
         meta = articles.load_meta(slug)
         if meta.get("state") == "book_built" and config.load_config().get("auto_approve", True):
             articles.set_state(slug, "approved", approved_at=articles.utcnow_iso())
+        elif meta.get("state") == "needs_review":
+            lloydio.report_status(lslug, "failed")
     except Exception as e:
         log.exception("extract/build failed for %s", slug)
         articles.set_state(slug, "failed", error=f"extract: {e}")
+        lloydio.report_status(lslug, "failed")
 
 
 # --- Stage C + D: Henty synthesis + local episode assembly ------------------
@@ -218,7 +234,12 @@ def _fetch_stitched(client: henty.HentyClient, st: dict, dest_dir: str) -> Path 
 
 def synthesize(slug: str) -> None:
     """Drive Henty for one job: import -> ASR loop per chunk -> stitch -> mp3."""
+    lslug = articles.load_meta(slug).get("lloydio_slug")
+    if lloydio.cancel_requested(lslug):
+        _cancelled(slug, lslug)
+        return
     articles.set_state(slug, "synthesizing", error=None)
+    lloydio.report_status(lslug, "in_progress")
     try:
         books_dir = config.henty_books_dir()
         if not books_dir:
@@ -235,7 +256,10 @@ def synthesize(slug: str) -> None:
 
         with henty.HentyClient() as client:
             client.load_project(project_path)
-            out = henty.synthesize_project(client, voice_sample=config.default_voice())
+            out = henty.synthesize_project(
+                client, voice_sample=config.default_voice(),
+                should_stop=lambda: lloydio.cancel_requested(lslug),
+            )
             with tempfile.TemporaryDirectory() as td:
                 wavs = [w for st in out["stitched"]
                         if (w := _fetch_stitched(client, st, td))]
@@ -271,9 +295,12 @@ def synthesize(slug: str) -> None:
                 except Exception:
                     # stays published locally; publish_pending retries it
                     log.exception("lloydio write-back failed for %s", slug)
+    except henty.JobCancelled:
+        _cancelled(slug, lslug)
     except Exception as e:
         log.exception("synthesis failed for %s", slug)
         articles.set_state(slug, "failed", error=str(e))
+        lloydio.report_status(lslug, "failed")
 
 
 # --- background worker ------------------------------------------------------

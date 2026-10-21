@@ -47,8 +47,10 @@ class _LloydioPoller:
             secs = 0
             try:
                 secs = lloydio_poll_seconds()
-                if secs > 0 and lloydio.sync().get("created"):
-                    tts.worker.kick()
+                if secs > 0:
+                    res = lloydio.sync()
+                    if res.get("created") or res.get("requeued"):
+                        tts.worker.kick()
             except Exception:
                 log.exception("lloydio poll failed")
             self._stop.wait(timeout=secs if secs and secs >= 30 else 60)
@@ -229,7 +231,7 @@ def ingest_lloydio() -> dict[str, Any]:
         res = lloydio.sync()
     except Exception as e:
         raise HTTPException(400, f"lloydio sync failed: {e}")
-    if res.get("created"):
+    if res.get("created") or res.get("requeued"):
         tts.worker.kick()
     return res
 

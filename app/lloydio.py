@@ -22,6 +22,7 @@ queue and puts it in the always-on feed. Uploads that fail are retried by
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -70,18 +71,26 @@ def sync(
 ) -> dict[str, list[str]]:
     """Poll the queue and create local jobs for new items.
 
-    Returns {"created": [slugs], "skipped": [urls]}. Deduped by source_url so
-    re-polling is idempotent. `create=False` does a dry run.
+    Returns {"created": [slugs], "requeued": [slugs], "skipped": [urls]}.
+    Deduped by source_url so re-polling is idempotent. An item that is back in
+    the queue after the owner cancelled it resumes; one whose episode was
+    deleted on lloydio gets its existing audio re-uploaded (publish_pending).
+    `create=False` does a dry run.
     """
     created: list[str] = []
+    requeued: list[str] = []
     skipped: list[str] = []
     for item in fetch_queue(base_url, transport=transport):
         url = item.get("url") or ""
         if not needs_narration(item):
             skipped.append(url or item.get("slug") or "?")
             continue
-        if articles.find_by_source_url(url):
-            skipped.append(url)
+        existing = articles.find_by_source_url(url)
+        if existing:
+            if create and _revive(existing, item):
+                requeued.append(existing["slug"])
+            else:
+                skipped.append(url)
             continue
         if not create:
             created.append(url)
@@ -103,11 +112,79 @@ def sync(
         )
         created.append(meta["slug"])
         log.info("queued from lloydio: %s (%s)", meta["slug"], url)
-    log.info("lloydio sync: +%d new, %d skipped", len(created), len(skipped))
-    return {"created": created, "skipped": skipped}
+    log.info("lloydio sync: +%d new, %d requeued, %d skipped",
+             len(created), len(requeued), len(skipped))
+    return {"created": created, "requeued": requeued, "skipped": skipped}
+
+
+def _revive(meta: dict[str, Any], item: dict[str, Any]) -> bool:
+    """Re-activate a local job whose URL is queued again on lloydio."""
+    slug, lslug = meta["slug"], item.get("slug") or meta.get("lloydio_slug")
+    if meta.get("state") == "cancelled":
+        # Keep any extracted text: an empty body re-extracts, a full one just
+        # rebuilds book.json.
+        articles.set_state(slug, "queued", error=None, lloydio_slug=lslug)
+        _cancel_checked.pop(lslug, None)
+        log.info("requeued %s (re-added after cancel)", slug)
+        return True
+    if meta.get("state") == "published" and meta.get("lloydio_published_at"):
+        # Deleted on lloydio, then queued again: re-upload the audio we have.
+        articles.set_state(slug, "published", lloydio_published_at=None, lloydio_slug=lslug)
+        log.info("will re-upload %s (episode deleted on lloydio, re-queued)", slug)
+        return True
+    return False
 
 
 EPISODE_PATH = "/api/episode"
+STATUS_PATH = "/api/episode-status"
+CANCEL_CHECK_SECONDS = 20.0
+_cancel_checked: dict[str, tuple[float, bool]] = {}
+
+
+def _writeback_ready() -> bool:
+    return bool(lloydio_base_url() and lloydio_episode_token())
+
+
+def report_status(
+    lloydio_slug: str | None, state: str,
+    transport: httpx.BaseTransport | None = None,
+) -> None:
+    """Tell lloydio's /reading page what this job is doing (in_progress |
+    failed | cancelled | clear). Best effort: never fails the job."""
+    if not lloydio_slug or not _writeback_ready():
+        return
+    try:
+        with httpx.Client(timeout=15.0, transport=transport) as c:
+            c.post(f"{lloydio_base_url()}{STATUS_PATH}",
+                   json={"slug": lloydio_slug, "state": state},
+                   headers={"Authorization": f"Bearer {lloydio_episode_token()}"}
+                   ).raise_for_status()
+    except httpx.HTTPError as e:
+        log.warning("status report %s=%s failed: %s", lloydio_slug, state, e)
+
+
+def cancel_requested(
+    lloydio_slug: str | None, transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """True when the owner cancelled this item on /reading. Checked at most
+    every CANCEL_CHECK_SECONDS per slug; network errors read as 'not cancelled'."""
+    if not lloydio_slug or not _writeback_ready():
+        return False
+    now = time.monotonic()
+    last = _cancel_checked.get(lloydio_slug)
+    if last and now - last[0] < CANCEL_CHECK_SECONDS:
+        return last[1]
+    cancelled = False
+    try:
+        with httpx.Client(timeout=10.0, transport=transport) as c:
+            r = c.get(f"{lloydio_base_url()}{STATUS_PATH}", params={"slug": lloydio_slug},
+                      headers={"Authorization": f"Bearer {lloydio_episode_token()}"})
+            r.raise_for_status()
+            cancelled = r.json().get("state") == "cancelled"
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("cancel check for %s failed: %s", lloydio_slug, e)
+    _cancel_checked[lloydio_slug] = (now, cancelled)
+    return cancelled
 
 
 def publishable(meta: dict[str, Any]) -> bool:
