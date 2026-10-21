@@ -187,3 +187,36 @@ def test_sync_leaves_failed_jobs_alone():
     _job("failed")
     res = lloydio.sync(base_url="https://lloyd.test", transport=_queue(_item(needs_audio=True)))
     assert res["requeued"] == [] and res["skipped"] == ["https://x/a"]
+
+
+def test_removed_on_lloydio_drops_the_job(monkeypatch):
+    calls = []
+    _route_httpx(monkeypatch, _status_server({"t-abc": "removed"}, calls))
+    slug = _job("queued", narrate=False)
+    tts.process_queued(slug)
+    m = articles.load_meta(slug)
+    assert m["state"] == "removed" and m["removed_at"]
+    assert not any(c[0] == "episode" for c in calls)  # never written back
+
+
+def test_episode_410_marks_removed(monkeypatch):
+    def handler(req):
+        if req.url.path == "/api/episode":
+            return httpx.Response(410, json={"error": "removed", "removed": True})
+        if req.method == "POST":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"state": None})
+    _route_httpx(monkeypatch, httpx.MockTransport(handler))
+    slug = _job("text_ready", narrate=False)
+    assert lloydio.publish_pending() == []
+    assert articles.load_meta(slug)["state"] == "removed"
+
+
+def test_readded_link_revives_removed_job():
+    slug = _job("removed", removed_at="2026-10-21T12:00:00Z", narrate=False)
+    stale = _queue(_item(needs_text=True), generated="2026-10-21T11:00:00.000Z")
+    lloydio.sync(transport=stale)
+    assert articles.load_meta(slug)["state"] == "removed"  # listing predates removal
+    lloydio.sync(transport=_queue(_item(needs_text=True)))  # built 13:00, after
+    m = articles.load_meta(slug)
+    assert m["state"] == "text_ready" and not m.get("removed_at")

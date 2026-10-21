@@ -71,4 +71,24 @@ td .row { flex-wrap: wrap; }
 #audio-wrap { margin-top: 12px; }
 audio { width: 100%; }
 
+/* Queues tab: two live lists side by side. */
+.queues { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 800px) { .queues { grid-template-columns: 1fr; } }
+.queues .card h2 { margin: 0; }
+.qlist { list-style: none; margin: 8px 0 0; padding: 0; }
+.qlist li { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.qlist li:last-child { border-bottom: none; }
+.qlist .qtitle { display: block; overflow-wrap: anywhere; }
+.qlist .qmeta { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.qlist li.running { background: #f3f8fb; margin: 0 -8px; padding: 8px; border-radius: 4px; }
+.qlist li.backoff .qtitle { color: var(--muted); }
+.qlist li.failed .qmeta { color: var(--danger); }
+.qlist li.empty { color: var(--muted); font-style: italic; }
+.qlist .qsep { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 12px 0 4px; border-bottom: none; }
+.qlist button { padding: 2px 8px; font-size: 12px; margin-top: 4px; }
+.bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.bar.indeterminate > span { width: 30%; animation: bar-slide 1.4s ease-in-out infinite; }
+@keyframes bar-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+
 code, .token { font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-size: 12px; background: #f4f1ea; padding: 1px 4px; border-radius: 3px; }

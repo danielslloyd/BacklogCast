@@ -56,3 +56,28 @@ def test_add_text_article_creates_queued_job():
     body = r.json()
     assert body["state"] == "queued"
     assert body["slug"]
+
+
+def test_queues_lists_work_in_worker_order(monkeypatch):
+    from app import articles, henty, main, tts
+    monkeypatch.setattr(henty, "is_available", lambda *a, **k: False)
+    main._henty_seen = (0.0, False)
+    mk = lambda t, st, **kw: articles.set_state(  # noqa: E731
+        articles.new_article(title=t, source_url=f"https://x/{t}", body="",
+                             raw_html=None, extraction_method="lloydio-queue")["slug"], st, **kw)
+    mk("later", "queued", retry_after="2999-01-01T00:00:00Z", extract_attempts=1)
+    mk("now", "queued")
+    mk("narrate", "approved", approved_at="2026-01-01T00:00:00Z")
+    mk("broke", "failed", error="extract: boom")
+    running = mk("busy", "synthesizing")
+    tts.set_progress(running["slug"], "synth", "narrating", 3, 10)
+    try:
+        q = client.get("/api/queues").json()
+    finally:
+        tts.clear_progress(running["slug"])
+    assert [m["title"] for m in q["extraction"]["waiting"]] == ["now", "later"]
+    assert [m["title"] for m in q["extraction"]["failed"]] == ["broke"]
+    assert [m["title"] for m in q["synthesis"]["waiting"]] == ["narrate"]
+    assert q["synthesis"]["running"][0]["title"] == "busy"
+    assert q["active"]["done"] == 3 and q["active"]["total"] == 10
+    assert q["henty_up"] is False

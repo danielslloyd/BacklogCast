@@ -11,7 +11,8 @@
   <header>
     <h1>BacklogCast</h1>
     <nav>
-      <button data-tab="queue" class="tab active">Queue</button>
+      <button data-tab="queue" class="tab active">Articles</button>
+      <button data-tab="queues" class="tab">Queues</button>
       <button data-tab="settings" class="tab">Settings</button>
     </nav>
   </header>
@@ -91,6 +92,26 @@
           <button id="publish-btn">Publish</button>
           <button id="unpublish-btn">Unpublish</button>
           <button id="delete-btn" class="danger">Delete</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-queues" class="tab-panel">
+      <p class="status" id="queues-status">Loading…</p>
+      <div class="queues">
+        <div class="card">
+          <div class="row between">
+            <h2>Text extraction</h2>
+            <span class="status" id="q-extract-count"></span>
+          </div>
+          <ol class="qlist" id="q-extract"></ol>
+        </div>
+        <div class="card">
+          <div class="row between">
+            <h2>Synthesis</h2>
+            <span class="status" id="q-synth-count"></span>
+          </div>
+          <ol class="qlist" id="q-synth"></ol>
         </div>
       </div>
     </section>

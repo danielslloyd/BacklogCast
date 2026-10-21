@@ -28,6 +28,7 @@ $$(".tab").forEach(btn => {
       p.classList.toggle("active", p.id === `tab-${btn.dataset.tab}`);
     });
     if (btn.dataset.tab === "settings") { loadConfig(); loadTokens(); }
+    if (btn.dataset.tab === "queues") refreshQueues();
   });
 });
 
@@ -331,6 +332,101 @@ setInterval(async () => {
     if (busy) await refreshArticles();
   } catch {}
 }, 5000);
+
+// --- queues tab: live view of what the worker will do, in order ------------
+function fmtWhen(iso) {
+  return iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+function fmtElapsed(fromIso, nowIso) {
+  const s = Math.max(0, (Date.parse(nowIso) - Date.parse(fromIso)) / 1000);
+  return s < 60 ? `${Math.round(s)}s` : fmtHMS(s);
+}
+
+function queueItem(m, kind, data) {
+  const li = document.createElement("li");
+  const attempts = kind === "extract" ? m.extract_attempts : m.synth_attempts;
+  const bits = [];
+  const a = data.active;
+  if (kind === "running") {
+    li.className = "running";
+    if (a.slug === m.slug) {
+      bits.push(a.step + (a.total ? ` — chunk ${a.done || 0} of ${a.total}` : ""));
+      bits.push(`for ${fmtElapsed(a.started, data.now)}`);
+    } else {
+      bits.push("starting…");
+    }
+  } else if (kind === "failed") {
+    li.className = "failed";
+    bits.push(m.error || "failed");
+  } else {
+    if (m.retry_after && m.retry_after > data.now) {
+      li.className = "backoff";
+      bits.push(`retry at ${fmtWhen(m.retry_after)} (attempt ${(attempts || 0) + 1} of 4)`);
+      if (m.error) bits.push(m.error);
+    } else if (attempts) {
+      bits.push(`attempt ${attempts + 1} of 4`);
+    }
+    if (kind === "extract" && m.narrate !== false) bits.push("narration requested");
+    if (kind === "synth" && m.n_chunks) bits.push(`${m.n_chunks} chunks`);
+  }
+  li.innerHTML = `<span class="qtitle">${escapeHtml(m.title || m.slug)}</span>` +
+    `<span class="qmeta">${bits.map(escapeHtml).join(" · ")}</span>`;
+  if (kind === "running" && a.slug === m.slug) {
+    const bar = document.createElement("div");
+    bar.className = a.total ? "bar" : "bar indeterminate";
+    bar.innerHTML = `<span style="width:${a.total ? Math.round(100 * (a.done || 0) / a.total) : 30}%"></span>`;
+    li.append(bar);
+  }
+  if (kind === "failed") {
+    li.append(makeBtn("Retry", async () => { await doAction(m.slug, "retry"); refreshQueues(); }));
+  }
+  return li;
+}
+
+function renderQueue(ol, q, kind, data, idleNote) {
+  ol.replaceChildren();
+  q.running.forEach(m => ol.append(queueItem(m, "running", data)));
+  q.waiting.forEach(m => ol.append(queueItem(m, kind, data)));
+  if (!q.running.length && !q.waiting.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Nothing waiting.";
+    ol.append(li);
+  } else if (idleNote) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = idleNote;
+    ol.prepend(li);
+  }
+  if (q.failed.length) {
+    const sep = document.createElement("li");
+    sep.className = "qsep";
+    sep.textContent = `Gave up (${q.failed.length})`;
+    ol.append(sep);
+    q.failed.forEach(m => ol.append(queueItem(m, "failed", data)));
+  }
+}
+
+async function refreshQueues() {
+  try {
+    const data = await api("GET", "/api/queues");
+    const e = data.extraction, s = data.synthesis;
+    renderQueue($("#q-extract"), e, "extract", data);
+    const textFirst = e.running.length || e.waiting.some(m => !(m.retry_after > data.now));
+    renderQueue($("#q-synth"), s, "synth", data,
+      !data.henty_up ? "Henty is offline — synthesis waits until it's up."
+        : textFirst && s.waiting.length ? "Waiting for text extraction to finish (text goes first)." : "");
+    $("#q-extract-count").textContent = `${e.running.length + e.waiting.length} queued`;
+    $("#q-synth-count").textContent = `${s.running.length + s.waiting.length} queued`;
+    setStatus("#queues-status", `Live — updated ${fmtWhen(data.now)}`);
+  } catch (err) {
+    setStatus("#queues-status", `Couldn't load queues: ${err.message}`, "err");
+  }
+}
+
+setInterval(() => {
+  if ($("#tab-queues").classList.contains("active") && !document.hidden) refreshQueues();
+}, 2000);
 
 // initial load
 refreshArticles();

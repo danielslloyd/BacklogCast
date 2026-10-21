@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import articles, extractor, feed, lloydio, tts
+from . import articles, extractor, feed, henty, lloydio, tts
 from .config import (
     admin_password, create_token, lloydio_poll_seconds, load_config, load_tokens,
     public_base_url, revoke_token, save_config, token_valid,
@@ -183,6 +184,51 @@ def list_articles(state: str | None = None) -> dict[str, Any]:
     items = list(articles.iter_articles(state=state))
     items.sort(key=lambda m: m.get("fetched_at") or "", reverse=True)
     return {"items": items}
+
+
+_henty_seen: tuple[float, bool] = (0.0, False)
+
+
+def _henty_up() -> bool:
+    """henty.is_available, cached briefly: the Queues tab polls every few seconds."""
+    global _henty_seen
+    if time.monotonic() - _henty_seen[0] > 15:
+        _henty_seen = (time.monotonic(), henty.is_available())
+    return _henty_seen[1]
+
+
+def _queue_row(m: dict[str, Any]) -> dict[str, Any]:
+    keys = ("slug", "title", "source_url", "state", "error", "retry_after",
+            "extract_attempts", "synth_attempts", "n_chunks", "narrate", "fetched_at")
+    return {k: m.get(k) for k in keys}
+
+
+@app.get("/api/queues")
+def queues() -> dict[str, Any]:
+    """The worker's two queues in the order it will take them, plus what it's
+    doing now. Mirrors TTSWorker._run: extraction (queued) all goes before
+    synthesis (approved); jobs in retry backoff wait their turn."""
+    all_ = list(articles.iter_articles())
+    by = lambda st, key: sorted((m for m in all_ if m.get("state") == st),  # noqa: E731
+                                key=lambda m: (not tts.due(m), m.get(key) or ""))
+    failed = [m for m in all_ if m.get("state") == "failed"]
+    extract_failed = [m for m in failed if str(m.get("error") or "").startswith("extract:")]
+    synth_failed = [m for m in failed if m not in extract_failed]
+    return {
+        "now": articles.utcnow_iso(),
+        "active": tts.current_progress(),
+        "henty_up": _henty_up(),
+        "extraction": {
+            "running": [_queue_row(m) for m in all_ if m.get("state") == "extracting"],
+            "waiting": [_queue_row(m) for m in by("queued", "fetched_at")],
+            "failed": [_queue_row(m) for m in extract_failed],
+        },
+        "synthesis": {
+            "running": [_queue_row(m) for m in all_ if m.get("state") == "synthesizing"],
+            "waiting": [_queue_row(m) for m in by("approved", "approved_at")],
+            "failed": [_queue_row(m) for m in synth_failed],
+        },
+    }
 
 
 @app.get("/api/articles/{slug}")

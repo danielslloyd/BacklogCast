@@ -86,6 +86,35 @@ def _measure_duration_seconds(path: Path) -> int:
     return 0
 
 
+# --- live progress ------------------------------------------------------------
+#
+# What the worker is doing right now, for the Queues tab: one job at a time, so
+# a single dict. In memory only; it resets when the server restarts.
+
+_progress: dict = {}
+_progress_lock = threading.Lock()
+
+
+def set_progress(slug: str, stage: str, step: str,
+                 done: int | None = None, total: int | None = None) -> None:
+    with _progress_lock:
+        if _progress.get("slug") != slug or _progress.get("stage") != stage:
+            _progress.clear()
+            _progress.update(slug=slug, stage=stage, started=articles.utcnow_iso())
+        _progress.update(step=step, done=done, total=total, updated=articles.utcnow_iso())
+
+
+def clear_progress(slug: str) -> None:
+    with _progress_lock:
+        if _progress.get("slug") == slug:
+            _progress.clear()
+
+
+def current_progress() -> dict:
+    with _progress_lock:
+        return dict(_progress)
+
+
 # --- bounded retries ---------------------------------------------------------
 #
 # A failed extraction or narration goes back to its waiting state with a
@@ -161,6 +190,7 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
     elif raw.exists():
         kind, src = "html", raw
     else:
+        set_progress(slug, "extract", "fetching")
         f = extractor.fetch(url)
         if f.kind == "pdf":
             pdf.write_bytes(f.content)
@@ -172,6 +202,7 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
     title, author, draft, method, low = meta.get("title") or "", "", "", "pdf", True
     publication, published = "", ""
     if kind == "html":
+        set_progress(slug, "extract", "drafting")
         result = extractor.extract(src.read_text(encoding="utf-8"), url=url)
         draft, method, low = result["body"], result["method"], result["confidence_low"]
         title, author = result["title"] or title, result["author"]
@@ -181,6 +212,7 @@ def extract_source(slug: str, last_try: bool = True) -> str | None:
     mode = config.claude_extract_mode()
     if mode == "always" or (mode == "fallback" and (low or kind == "pdf")):
         try:
+            set_progress(slug, "extract", "Claude cleanup")
             cr = claude_extract.clean_with_claude(src, kind, draft)
             if cr.verdict == "not_article":
                 raise PermanentError(f"not an article ({cr.reason})")
@@ -261,6 +293,7 @@ def build_book(slug: str, last_try: bool = True) -> dict:
         meta = articles.load_meta(slug)
     body = articles.load_body(slug)
 
+    set_progress(slug, "extract", "building book.json")
     book = bookjson.build(body, title=meta.get("title") or "",
                           intro=lambda title_spoken: intro_text(meta, title_spoken))
 
@@ -299,6 +332,8 @@ def _send_text(slug: str) -> None:
     if lloydio.text_publishable(meta) and config.lloydio_episode_token():
         try:
             lloydio.publish_text(slug)
+        except lloydio.Removed:
+            pass
         except Exception:
             # publish_pending retries it
             log.exception("lloydio text write-back failed for %s", slug)
@@ -310,6 +345,9 @@ def process_queued(slug: str) -> None:
     Failures are retried with backoff (see _retry_or_fail)."""
     meta = articles.load_meta(slug)
     lslug = meta.get("lloydio_slug")
+    if lloydio.removed(lslug):
+        lloydio.mark_removed(slug)
+        return
     narrate = lloydio.narrating(meta)
     if narrate and lloydio.cancel_requested(lslug):
         articles.set_state(slug, "queued", narrate=False,
@@ -321,9 +359,11 @@ def process_queued(slug: str) -> None:
     lloydio.report_text_status(lslug, "in_progress")
     if narrate:
         lloydio.report_status(lslug, "in_progress")
+    set_progress(slug, "extract", "starting")
     try:
         build_book(slug, last_try=last_try)
     except Exception as e:
+        clear_progress(slug)
         log.exception("extract/build failed for %s", slug)
         err = f"extract: {e}"
         retry = _retry_or_fail(slug, "extract", err, "queued",
@@ -332,6 +372,7 @@ def process_queued(slug: str) -> None:
         if narrate:
             lloydio.report_status(lslug, "clear" if retry else "failed")
         return
+    clear_progress(slug)
     meta = articles.set_state(slug, articles.load_meta(slug)["state"], retry_after=None)
     lloydio.report_text_status(lslug, "clear")
     if not narrate:
@@ -375,11 +416,15 @@ def synthesize(slug: str) -> None:
     """Drive Henty for one job: import -> ASR loop per chunk -> stitch -> mp3."""
     meta = articles.load_meta(slug)
     lslug = meta.get("lloydio_slug")
+    if lloydio.removed(lslug):
+        lloydio.mark_removed(slug)
+        return
     if not lloydio.narrating(meta) or lloydio.cancel_requested(lslug):
         _stop_narrating(slug, lslug)
         return
     articles.set_state(slug, "synthesizing", error=None)
     lloydio.report_status(lslug, "in_progress")
+    set_progress(slug, "synth", "importing into Henty")
     try:
         books_dir = config.henty_books_dir()
         if not books_dir:
@@ -394,12 +439,23 @@ def synthesize(slug: str) -> None:
             raise henty.HentyError(f"book import failed: {out}")
         project_path = henty.project_path_for(slug)
 
+        total = articles.load_meta(slug).get("n_chunks")
+        done = 0
+
+        def chunk_done(_res) -> None:
+            nonlocal done
+            done += 1
+            set_progress(slug, "synth", "narrating", done, total)
+
         with henty.HentyClient() as client:
             client.load_project(project_path)
+            set_progress(slug, "synth", "narrating", 0, total)
             out = henty.synthesize_project(
                 client, voice_sample=config.default_voice(),
+                progress=chunk_done,
                 should_stop=lambda: lloydio.cancel_requested(lslug),
             )
+            set_progress(slug, "synth", "stitching", done, total)
             with tempfile.TemporaryDirectory() as td:
                 wavs = [w for st in out["stitched"]
                         if (w := _fetch_stitched(client, st, td))]
@@ -410,6 +466,7 @@ def synthesize(slug: str) -> None:
                 d = article_dir(slug)
                 d.mkdir(parents=True, exist_ok=True)
                 mp3 = d / "audio.mp3"
+                set_progress(slug, "synth", "encoding mp3", done, total)
                 if _wav_to_mp3(combined, mp3):
                     final, fname = mp3, "audio.mp3"
                 else:
@@ -430,23 +487,46 @@ def synthesize(slug: str) -> None:
         if config.load_config().get("auto_publish", True):
             articles.set_state(slug, "published", published_at=articles.utcnow_iso())
             if lloydio.publishable(articles.load_meta(slug)) and config.lloydio_episode_token():
+                set_progress(slug, "synth", "uploading to lloydio", done, total)
                 try:
                     lloydio.publish_episode(slug)
+                except lloydio.Removed:
+                    pass
                 except Exception:
                     # stays published locally; publish_pending retries it
                     log.exception("lloydio write-back failed for %s", slug)
     except henty.JobCancelled:
-        _stop_narrating(slug, lslug)
+        if lloydio.removed(lslug):
+            lloydio.mark_removed(slug)
+        else:
+            _stop_narrating(slug, lslug)
     except Exception as e:
         log.exception("synthesis failed for %s", slug)
         retry = _retry_or_fail(slug, "synth", str(e), "approved")
         # A scheduled retry reads as plain "queued" on /reading meanwhile.
         lloydio.report_status(lslug, "clear" if retry else "failed")
+    finally:
+        clear_progress(slug)
 
 
 # --- background worker ------------------------------------------------------
 
 WRITEBACK_RETRY_SECONDS = 600
+
+
+def recover_interrupted() -> list[str]:
+    """Jobs left mid-step by a restart (only one worker runs, so nothing else
+    is working on them): put them back where the worker will pick them up.
+    Doesn't count as a failed attempt."""
+    back = {"extracting": "queued", "synthesizing": "approved"}
+    moved = []
+    for m in articles.iter_articles():
+        nxt = back.get(m.get("state"))
+        if nxt:
+            articles.set_state(m["slug"], nxt)
+            moved.append(m["slug"])
+            log.info("resuming %s (was %s when the server stopped)", m["slug"], m["state"])
+    return moved
 
 
 class TTSWorker:
@@ -472,6 +552,7 @@ class TTSWorker:
 
     def _run(self) -> None:
         log.info("TTS worker started")
+        recover_interrupted()
         while not self._stop.is_set():
             try:
                 if time.monotonic() - self._last_writeback > WRITEBACK_RETRY_SECONDS:

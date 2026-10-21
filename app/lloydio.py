@@ -154,6 +154,21 @@ def _update(meta: dict[str, Any], item: dict[str, Any], needs_audio: bool) -> bo
     slug, lslug = meta["slug"], item.get("slug") or meta.get("lloydio_slug")
     state, has_body = meta.get("state"), bool(articles.load_body(slug).strip())
 
+    if state == "removed":
+        if not _newer(item, meta.get("removed_at")):
+            return False
+        # Re-added to the reading list after removal: start over from the text.
+        has_body = bool(articles.load_body(slug).strip())
+        articles.set_state(slug, "text_ready" if has_body else "queued", lloydio_slug=lslug,
+                           narrate=False, removed_at=None, lloydio_text_published_at=None,
+                           lloydio_published_at=None, extract_attempts=0, synth_attempts=0,
+                           narrate_changed_at=articles.utcnow_iso())
+        log.info("%s is back on the reading list", slug)
+        meta = articles.load_meta(slug)
+        state = meta["state"]
+        if has_body:
+            publish_text_safely(slug)
+
     if state == "cancelled":
         # Older cancel state: park as text-only (re-queuing below can lift it).
         state = "text_ready" if has_body else "queued"
@@ -239,28 +254,51 @@ def report_text_status(
         log.warning("text status report %s=%s failed: %s", lloydio_slug, state, e)
 
 
-def cancel_requested(
+def remote_state(
     lloydio_slug: str | None, transport: httpx.BaseTransport | None = None,
-) -> bool:
-    """True when the owner cancelled this item on /reading. Checked at most
-    every CANCEL_CHECK_SECONDS per slug; network errors read as 'not cancelled'."""
+) -> str | None:
+    """The owner's live state for this item on /reading (`cancelled`,
+    `removed`, ...), or None. Checked at most every CANCEL_CHECK_SECONDS per
+    slug; network errors read as None."""
     if not lloydio_slug or not _writeback_ready():
-        return False
+        return None
     now = time.monotonic()
     last = _cancel_checked.get(lloydio_slug)
     if last and now - last[0] < CANCEL_CHECK_SECONDS:
         return last[1]
-    cancelled = False
+    state = None
     try:
         with httpx.Client(timeout=10.0, transport=transport) as c:
             r = c.get(f"{lloydio_base_url()}{STATUS_PATH}", params={"slug": lloydio_slug},
                       headers={"Authorization": f"Bearer {lloydio_episode_token()}"})
             r.raise_for_status()
-            cancelled = r.json().get("state") == "cancelled"
+            state = r.json().get("state")
     except (httpx.HTTPError, ValueError) as e:
-        log.warning("cancel check for %s failed: %s", lloydio_slug, e)
-    _cancel_checked[lloydio_slug] = (now, cancelled)
-    return cancelled
+        log.warning("status check for %s failed: %s", lloydio_slug, e)
+    _cancel_checked[lloydio_slug] = (now, state)
+    return state
+
+
+def cancel_requested(
+    lloydio_slug: str | None, transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """True when the owner cancelled (or removed) this item on /reading."""
+    return remote_state(lloydio_slug, transport) in ("cancelled", "removed")
+
+
+def removed(lloydio_slug: str | None, transport: httpx.BaseTransport | None = None) -> bool:
+    """True when the owner took this link off the reading list."""
+    return remote_state(lloydio_slug, transport) == "removed"
+
+
+class Removed(RuntimeError):
+    """lloydio refused a write-back: the link is off the reading list."""
+
+
+def mark_removed(slug: str) -> None:
+    articles.set_state(slug, "removed", removed_at=articles.utcnow_iso(),
+                       retry_after=None, error=None)
+    log.info("%s was removed from lloydio's reading list; dropping it", slug)
 
 
 def publishable(meta: dict[str, Any]) -> bool:
@@ -309,6 +347,9 @@ def _post_episode(slug: str, with_audio: bool, base_url: str | None,
         with httpx.Client(timeout=timeout, transport=transport) as c:
             r = c.post(f"{base}{EPISODE_PATH}", data=fields, files=files,
                        headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 410:
+                mark_removed(slug)
+                raise Removed(f"{slug} is no longer on the reading list")
             if r.status_code >= 400:
                 raise httpx.HTTPStatusError(
                     f"{r.status_code} from /api/episode: {r.text[:300]}",
@@ -352,6 +393,13 @@ def publish_text(
     return res
 
 
+def publish_text_safely(slug: str) -> None:
+    try:
+        publish_text(slug)
+    except Exception:
+        log.exception("lloydio text write-back failed for %s", slug)  # publish_pending retries
+
+
 def publish_pending(transport: httpx.BaseTransport | None = None) -> list[str]:
     """Retry write-back for every episode or text-only job not yet on lloydio."""
     if not (lloydio_base_url() and lloydio_episode_token()):
@@ -366,6 +414,8 @@ def publish_pending(transport: httpx.BaseTransport | None = None) -> list[str]:
             else:
                 continue
             done.append(meta["slug"])
+        except Removed:
+            pass
         except Exception:
             log.exception("lloydio write-back failed for %s", meta["slug"])
     return done

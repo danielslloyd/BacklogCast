@@ -126,3 +126,13 @@ def test_extract_records_publication_and_date(monkeypatch):
     tts.process_queued(meta["slug"])
     m = articles.load_meta(meta["slug"])
     assert (m["author"], m["publication"], m["published"]) == ("Ann", "example.com", "2023-01-02")
+
+
+def test_restart_resumes_interrupted_jobs():
+    a = articles.new_article(title="A", source_url="http://x/a", body="", raw_html=None,
+                             extraction_method="x", state="extracting")
+    b = articles.new_article(title="B", source_url="http://x/b", body="# B\n\nHi.\n",
+                             raw_html=None, extraction_method="x", state="synthesizing")
+    assert sorted(tts.recover_interrupted()) == sorted([a["slug"], b["slug"]])
+    assert articles.load_meta(a["slug"])["state"] == "queued"
+    assert articles.load_meta(b["slug"])["state"] == "approved"

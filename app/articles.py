@@ -25,6 +25,7 @@ STATES = {
     "failed",        # error; see the `error` field
     "text_ready",    # clean text extracted (and sent to lloydio); not narrated
     "cancelled",     # legacy: narration cancelled; sync moves these to text_ready
+    "removed",       # owner took it off lloydio's reading list; nothing more to do
 }
 
 # States from which the article can be (re)published into the feed.
