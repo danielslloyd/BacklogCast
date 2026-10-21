@@ -103,6 +103,9 @@ async function refreshArticles() {
     if (m.state === "published") {
       actions.appendChild(makeBtn("unpublish", () => doAction(m.slug, "unpublish")));
     }
+    if (m.audio_filename || ["stitched", "ready", "published"].includes(m.state)) {
+      actions.appendChild(makeBtn("delete audio", () => confirmDeleteAudio(m.slug)));
+    }
     actions.appendChild(makeBtn("delete", () => confirmDelete(m.slug), "danger"));
     tbody.appendChild(tr);
   }
@@ -128,6 +131,32 @@ async function doAction(slug, action) {
   } catch (e) {
     alert(`Action failed: ${e.message}`);
   }
+}
+
+async function confirmDeleteAudio(slug) {
+  if (!confirm(
+    `Delete the audio for "${slug}"?\n\n` +
+    `The article text is kept. This also clears Henty's project folder ` +
+    `(every per-chunk take) and removes it from the feed.\n\n` +
+    `Use "approve" to re-narrate it later.`
+  )) return;
+  try {
+    const m = await api("POST", `/api/articles/${encodeURIComponent(slug)}/delete-audio`);
+    await refreshArticles();
+    if (currentSlug === slug) await openPreview(slug);
+    setStatus("#add-status", `Deleted audio for "${slug}" — freed ${fmtBytes(m.freed_bytes)}.`, "ok");
+  } catch (e) {
+    alert(`Delete audio failed: ${e.message}`);
+  }
+}
+
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
 }
 
 async function confirmDelete(slug) {

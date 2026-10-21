@@ -11,6 +11,11 @@ ARTICLES_DIR = ROOT / "articles"
 CONFIG_PATH = ROOT / "config.json"
 TOKENS_PATH = ROOT / "tokens.json"
 COVER_PATH = ROOT / "cover.jpg"
+PASSWORD_PATH = ROOT / "password.txt"
+
+# Guards the admin UI + /api/*. The public feed/audio/cover stay open so
+# podcast clients (which can't log in) can still fetch episodes.
+DEFAULT_PASSWORD = "BacklogCast2024"
 
 DEFAULT_CONFIG = {
     "podcast_title": "BacklogCast",
@@ -54,6 +59,8 @@ def ensure_data_tree() -> None:
         # bootstrap a single token so the user has something usable on day one
         initial = {"default": secrets.token_urlsafe(32)}
         TOKENS_PATH.write_text(json.dumps(initial, indent=2))
+    if not PASSWORD_PATH.exists():
+        PASSWORD_PATH.write_text(DEFAULT_PASSWORD + "\n", encoding="utf-8")
 
 
 def article_dir(slug: str) -> Path:

@@ -88,6 +88,10 @@ def raw_html_path(slug: str) -> Path:
     return article_dir(slug) / "raw.html"
 
 
+def source_pdf_path(slug: str) -> Path:
+    return article_dir(slug) / "source.pdf"
+
+
 def load_meta(slug: str) -> dict[str, Any]:
     return json.loads(meta_path(slug).read_text())
 
@@ -132,6 +136,49 @@ def delete_article(slug: str) -> None:
     d = article_dir(slug)
     if d.exists():
         shutil.rmtree(d)
+
+
+def delete_audio(slug: str) -> tuple[dict[str, Any], int]:
+    """Delete generated audio but keep the article's text and metadata.
+
+    Removes the episode file *and* the whole Henty project folder. That folder
+    holds every per-chunk take -- the bulk of the disk use -- and leaving it
+    behind would make Henty's importer bail with "skipped (audio already
+    exists)" on the next run and re-narrate stale text.
+
+    Lands in `needs_review`: the TTS worker only picks up `queued` and
+    `approved`, so the audio we just freed won't immediately regenerate. The
+    UI's "approve" button re-narrates on demand.
+
+    Returns (meta, bytes_freed).
+    """
+    from .config import henty_books_dir  # local import keeps this module leaf-level
+
+    meta = load_meta(slug)
+    freed = 0
+
+    fname = meta.get("audio_filename")
+    if fname:
+        p = article_dir(slug) / fname
+        if p.exists():
+            freed += p.stat().st_size
+            p.unlink()
+
+    books_dir = henty_books_dir()
+    if books_dir:
+        project = Path(books_dir) / slug
+        if project.is_dir():
+            freed += sum(f.stat().st_size for f in project.rglob("*") if f.is_file())
+            shutil.rmtree(project)
+
+    meta = set_state(
+        slug, "needs_review",
+        audio_filename=None, audio_bytes=None, duration_seconds=None,
+        chunk_reports=[], chunks_below_threshold=0,
+        book_json_path=None, henty_project_path=None,
+        published_at=None, error=None,
+    )
+    return meta, freed
 
 
 def audio_path(slug: str) -> Path | None:

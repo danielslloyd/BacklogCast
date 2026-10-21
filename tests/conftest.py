@@ -5,6 +5,10 @@ import tempfile
 
 # Must be set before any `app.paths` import (module-level ROOT reads it once).
 os.environ.setdefault("BACKLOGCAST_DATA", tempfile.mkdtemp(prefix="blc-test-"))
+# Never shell out to the real Claude CLI from tests (tests opt in by mocking it).
+os.environ["CLAUDE_EXTRACT"] = "off"
+# Never write back to a real lloydio from tests.
+os.environ.pop("LLOYDIO_EPISODE_TOKEN", None)
 
 import pytest  # noqa: E402
 

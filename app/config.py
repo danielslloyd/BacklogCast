@@ -6,7 +6,7 @@ import os
 import secrets
 from typing import Any
 
-from .paths import CONFIG_PATH, DEFAULT_CONFIG, TOKENS_PATH
+from .paths import CONFIG_PATH, DEFAULT_CONFIG, DEFAULT_PASSWORD, PASSWORD_PATH, TOKENS_PATH
 
 
 def load_config() -> dict[str, Any]:
@@ -37,6 +37,23 @@ def public_base_url(request_host: str | None = None) -> str:
     if request_host:
         return request_host.rstrip("/")
     return "http://127.0.0.1:8000"
+
+
+def admin_password() -> str:
+    """Password guarding the admin UI and /api/*. Env wins, then
+    data/password.txt, then the built-in default. Feed and audio URLs stay
+    public (they carry their own unguessable per-feed token)."""
+    env = os.environ.get("BACKLOGCAST_PASSWORD", "").strip()
+    if env:
+        return env
+    try:
+        if PASSWORD_PATH.exists():
+            stored = PASSWORD_PATH.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+    except OSError:
+        pass
+    return DEFAULT_PASSWORD
 
 
 # --- integration settings (env var wins over config.json) -------------------
@@ -93,6 +110,26 @@ def asr_max_retries() -> int:
         return int(load_config().get("asr_max_retries", 4))
     except (TypeError, ValueError):
         return 4
+
+
+def claude_extract_mode() -> str:
+    """always | fallback | off. `always` runs the Claude cleanup on every
+    fetched URL; `fallback` only for PDFs and weak/failed automatic drafts."""
+    mode = _setting("CLAUDE_EXTRACT", "claude_extract", "always").lower()
+    return mode if mode in ("always", "fallback", "off") else "always"
+
+
+def claude_bin() -> str:
+    return os.environ.get("CLAUDE_BIN", "").strip()
+
+
+def claude_model() -> str:
+    return _setting("CLAUDE_MODEL", "claude_model", "sonnet")
+
+
+def lloydio_episode_token() -> str:
+    # Secret: env-only, never persisted to config.json.
+    return os.environ.get("LLOYDIO_EPISODE_TOKEN", "").strip()
 
 
 def lloydio_poll_seconds() -> int:

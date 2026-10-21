@@ -3,12 +3,13 @@ setlocal enableextensions
 cd /d "%~dp0"
 
 REM ============================================================
-REM  Optional: auto-start BacklogCast at logon (always-on feed).
-REM  Pairs with the always-on cloudflared service so your phone
-REM  can auto-download episodes any time.
+REM  Auto-start BacklogCast (and Henty, via start.bat) at logon, so
+REM  queued lloydio links get narrated whenever the desktop is on.
+REM  Episodes are hosted by lloydio/R2, so the feed stays up when
+REM  the desktop is off -- no tunnel needed.
 REM ============================================================
 
-schtasks /Create /F /SC ONLOGON /TN "BacklogCast" /TR "\"%~dp0start_backlogcast.bat\""
+schtasks /Create /F /SC ONLOGON /TN "BacklogCast" /TR "\"%~dp0start.bat\""
 if errorlevel 1 (
     echo Failed to create the scheduled task.
 ) else (

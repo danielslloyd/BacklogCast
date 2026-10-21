@@ -1,8 +1,16 @@
 """URL → cleaned Markdown extraction with trafilatura, readability fallback."""
 from __future__ import annotations
 
+import html as htmllib
+import json
 import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import trafilatura
@@ -11,17 +19,145 @@ from readability import Document
 
 
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
+# A full browser-like header set. A bare UA + Accept got 403s from Substack
+# while curl with a current UA got 200 from the same machine.
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/pdf;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+_TRACKING_PARAMS = {"selection", "triedredirect", "fbclid", "gclid", "mc_cid",
+                    "mc_eid", "ref", "ref_src", "s", "r"}
+
+
+def clean_url(url: str) -> str:
+    """Drop tracking params (utm_*, Substack's selection/triedRedirect, …) and
+    the fragment (incl. `#:~:text=` highlights) before fetching."""
+    parts = urlsplit(url.strip())
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if not k.lower().startswith("utm_") and k.lower() not in _TRACKING_PARAMS]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+@dataclass
+class Fetched:
+    kind: str          # "html" | "pdf"
+    content: bytes
+    url: str           # final URL after redirects
+    text: str = ""     # decoded HTML (empty for PDFs)
+
+
+@dataclass
+class _Resp:
+    status: int
+    content_type: str
+    url: str
+    content: bytes
+    text: str
+
+
+def _from_httpx(r: httpx.Response) -> _Resp:
+    return _Resp(r.status_code, r.headers.get("content-type", "").lower(),
+                 str(r.url), r.content, r.text)
+
+
+def _curl_get(url: str, timeout: float) -> _Resp | None:
+    """Fetch with the system curl. Some hosts (Substack, behind bot detection)
+    refuse Python's TLS fingerprint but accept curl's with the same headers."""
+    exe = shutil.which("curl")
+    if not exe:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "body"
+        cmd = [exe, "-sL", "--compressed", "--max-time", str(int(timeout)),
+               "-o", str(out), "-w", "%{http_code}\n%{content_type}\n%{url_effective}"]
+        for k, v in BROWSER_HEADERS.items():
+            if k != "Accept-Encoding":  # --compressed sets it
+                cmd += ["-H", f"{k}: {v}"]
+        try:
+            proc = subprocess.run(cmd + [url], capture_output=True, text=True,
+                                  timeout=timeout + 10)
+        except subprocess.TimeoutExpired:
+            return None
+        lines = (proc.stdout or "").splitlines() + ["", "", ""]
+        if proc.returncode != 0 or not lines[0].isdigit() or not out.exists():
+            return None
+        body = out.read_bytes()
+    ctype = lines[1].lower()
+    m = re.search(r"charset=([\w-]+)", ctype)
+    text = body.decode(m.group(1) if m else "utf-8", errors="replace")
+    return _Resp(int(lines[0]), ctype, lines[2] or url, body, text)
+
+
+def _get(c: httpx.Client, url: str, timeout: float) -> _Resp:
+    """httpx first (retrying once on 403/429), then system curl on any 4xx/5xx."""
+    r = _from_httpx(c.get(url))
+    if r.status in (403, 429):
+        r = _from_httpx(c.get(url))
+    if r.status >= 400:
+        r = _curl_get(url, timeout) or r
+    return r
+
+
+def _is_pdf(r: _Resp) -> bool:
+    return "application/pdf" in r.content_type or r.content[:5] == b"%PDF-"
+
+
+def _substack_api_html(c: httpx.Client, url: str, timeout: float) -> str | None:
+    """Substack's JSON API (`/api/v1/posts/<slug>`) often answers when the page
+    itself refuses. Returns a minimal HTML document, or None."""
+    parts = urlsplit(url)
+    m = re.match(r"^/p/([^/]+)", parts.path)
+    if not m:
+        return None
+    api = urlunsplit((parts.scheme, parts.netloc, f"/api/v1/posts/{m.group(1)}", "", ""))
+    r = _get(c, api, timeout)
+    if r.status >= 400:
+        return None
+    try:
+        data = json.loads(r.text)
+    except ValueError:
+        return None
+    body = data.get("body_html")
+    if not body:
+        return None
+    title = htmllib.escape(data.get("title") or "")
+    return (f"<html><head><title>{title}</title></head><body><article>"
+            f"<h1>{title}</h1>{body}</article></body></html>")
+
+
+def fetch(url: str, timeout: float = 30.0) -> Fetched:
+    """Fetch a URL as a browser would: httpx, then system curl, then (for
+    Substack /p/<slug> URLs) the Substack API. Detects PDFs by type or magic
+    bytes. Raises httpx.HTTPStatusError if every route fails."""
+    target = clean_url(url)
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=BROWSER_HEADERS) as c:
+        r = _get(c, target, timeout)
+        if r.status >= 400:
+            html = _substack_api_html(c, r.url, timeout)
+            if html:
+                return Fetched("html", html.encode("utf-8"), r.url, html)
+            req = httpx.Request("GET", r.url)
+            raise httpx.HTTPStatusError(
+                f"{r.status} fetching {r.url}", request=req,
+                response=httpx.Response(r.status, request=req))
+        if _is_pdf(r):
+            return Fetched("pdf", r.content, r.url)
+        return Fetched("html", r.content, r.url, r.text)
 
 
 def fetch_url(url: str, timeout: float = 30.0) -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as c:
-        r = c.get(url)
-        r.raise_for_status()
-        return r.text
+    """HTML-only convenience wrapper around `fetch`."""
+    f = fetch(url, timeout=timeout)
+    if f.kind != "html":
+        raise ValueError(f"expected HTML, got {f.kind}")
+    return f.text
 
 
 def _html_to_md_with_trafilatura(html: str, url: str | None) -> tuple[str, str, str]:

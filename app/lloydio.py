@@ -11,8 +11,13 @@ lloydio exposes a public, unauthenticated queue at
 The queue is already filtered to items needing work (`status=="queued"` or no
 audio). We dedupe against the local store by `source_url` and create jobs in
 state `queued`; the TTS worker then extracts, builds book.json, drives Henty,
-and publishes to the local feed. We never write back to lloydio — the local
-store is the source of truth for "done".
+and publishes to the local feed.
+
+Write-back (Stage E): `publish_episode` POSTs the finished mp3 + clean text to
+lloydio's `/api/episode` (Bearer LLOYDIO_EPISODE_TOKEN). lloydio stores the mp3
+in R2 and commits `src/content/articles/<slug>.md`, which takes the item off the
+queue and puts it in the always-on feed. Uploads that fail are retried by
+`publish_pending`.
 """
 from __future__ import annotations
 
@@ -22,7 +27,8 @@ from typing import Any
 import httpx
 
 from . import articles
-from .config import lloydio_base_url
+from .articles import article_dir
+from .config import lloydio_base_url, lloydio_episode_token
 
 log = logging.getLogger("backlogcast.lloydio")
 
@@ -99,3 +105,68 @@ def sync(
         log.info("queued from lloydio: %s (%s)", meta["slug"], url)
     log.info("lloydio sync: +%d new, %d skipped", len(created), len(skipped))
     return {"created": created, "skipped": skipped}
+
+
+EPISODE_PATH = "/api/episode"
+
+
+def publishable(meta: dict[str, Any]) -> bool:
+    """Locally published, has a source URL (lloydio's schema requires one) and
+    an audio file, and hasn't been written back yet."""
+    return (meta.get("state") == "published" and bool(meta.get("source_url"))
+            and bool(meta.get("audio_filename")) and not meta.get("lloydio_published_at"))
+
+
+def publish_episode(
+    slug: str,
+    base_url: str | None = None,
+    timeout: float = 300.0,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, Any]:
+    """Upload one finished episode to lloydio. Records lloydio_published_at on
+    success, or lloydio_error on failure (the job itself stays published)."""
+    meta = articles.load_meta(slug)
+    base = (base_url or lloydio_base_url()).rstrip("/")
+    token = lloydio_episode_token()
+    if not base or not token:
+        raise RuntimeError("LLOYDIO_BASE_URL and LLOYDIO_EPISODE_TOKEN must be set")
+    audio = article_dir(slug) / meta["audio_filename"]
+    fields = {
+        "slug": meta.get("lloydio_slug") or slug,
+        "title": meta.get("title") or slug,
+        "url": meta["source_url"],
+        "date": meta.get("published_at") or articles.utcnow_iso(),
+        "duration_seconds": str(meta.get("duration_seconds") or 0),
+        "markdown": articles.load_body(slug),
+    }
+    ctype = "audio/mpeg" if audio.suffix == ".mp3" else "audio/wav"
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as c, audio.open("rb") as fh:
+            r = c.post(f"{base}{EPISODE_PATH}", data=fields,
+                       files={"audio": (audio.name, fh, ctype)},
+                       headers={"Authorization": f"Bearer {token}"})
+            r.raise_for_status()
+            res = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        articles.set_state(slug, meta["state"], lloydio_error=str(e)[:500])
+        raise
+    articles.set_state(slug, meta["state"], lloydio_published_at=articles.utcnow_iso(),
+                       lloydio_audio_url=res.get("audio_url"), lloydio_error=None)
+    log.info("published %s to lloydio (%s)", slug, res.get("audio_url"))
+    return res
+
+
+def publish_pending(transport: httpx.BaseTransport | None = None) -> list[str]:
+    """Retry write-back for every published episode not yet on lloydio."""
+    if not (lloydio_base_url() and lloydio_episode_token()):
+        return []
+    done: list[str] = []
+    for meta in articles.iter_articles(state="published"):
+        if not publishable(meta):
+            continue
+        try:
+            publish_episode(meta["slug"], transport=transport)
+            done.append(meta["slug"])
+        except Exception:
+            log.exception("lloydio write-back failed for %s", meta["slug"])
+    return done

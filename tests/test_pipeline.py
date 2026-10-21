@@ -31,7 +31,8 @@ def test_process_queued_builds_clean_book_from_body():
 
 
 def test_process_queued_fetches_when_body_empty(monkeypatch):
-    monkeypatch.setattr(extractor, "fetch_url", lambda url, **k: "<html/>")
+    monkeypatch.setattr(extractor, "fetch", lambda url, **k: extractor.Fetched(
+        "html", b"<html/>", url, "<html/>"))
     monkeypatch.setattr(extractor, "extract", lambda html, url=None: {
         "body": "# Heading\n\nHello world. Second sentence here.\n",
         "title": "Fetched", "author": "", "method": "trafilatura",

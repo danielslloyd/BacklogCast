@@ -1,8 +1,10 @@
 """FastAPI app: UI static files, JSON API, RSS feed, audio streaming."""
 from __future__ import annotations
 
+import base64
 import logging
 import re
+import secrets
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,10 +17,10 @@ from pydantic import BaseModel
 
 from . import articles, extractor, feed, lloydio, tts
 from .config import (
-    create_token, lloydio_poll_seconds, load_config, load_tokens, public_base_url,
-    revoke_token, save_config, token_valid,
+    admin_password, create_token, lloydio_poll_seconds, load_config, load_tokens,
+    public_base_url, revoke_token, save_config, token_valid,
 )
-from .paths import COVER_PATH, ensure_data_tree, article_dir
+from .paths import COVER_PATH, DEFAULT_PASSWORD, ensure_data_tree, article_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("backlogcast")
@@ -58,6 +60,11 @@ poller = _LloydioPoller()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_data_tree()
+    if admin_password() == DEFAULT_PASSWORD:
+        log.warning(
+            "admin password is the built-in default; this box is reachable "
+            "publicly, so change data/password.txt or set BACKLOGCAST_PASSWORD."
+        )
     tts.worker.start()
     poller.start()
     log.info("backlogcast ready")
@@ -69,6 +76,41 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="BacklogCast", lifespan=lifespan)
+
+
+# --- auth ------------------------------------------------------------------
+# Podcast clients can't log in, so the feed, its audio enclosures, and the
+# cover art stay public (those URLs carry their own secret per-feed token).
+# Everything else — the admin UI, its static assets, and the whole /api
+# surface — requires the admin password via HTTP Basic auth.
+_PUBLIC_PREFIXES = ("/feed/", "/audio/")
+_PUBLIC_PATHS = {"/cover.jpg"}
+
+
+def _is_public_path(path: str) -> bool:
+    return path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
+
+
+@app.middleware("http")
+async def require_admin_auth(request: Request, call_next):
+    if _is_public_path(request.url.path):
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    if header.startswith("Basic "):
+        try:
+            _user, _, supplied = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+        except (ValueError, UnicodeDecodeError):
+            supplied = ""
+        expected = admin_password()
+        if supplied and secrets.compare_digest(
+            supplied.encode("utf-8"), expected.encode("utf-8")
+        ):
+            return await call_next(request)
+    return Response(
+        "Authentication required.",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="BacklogCast"'},
+    )
 
 
 # --- request models -------------------------------------------------------
@@ -151,22 +193,17 @@ def get_article(slug: str) -> dict[str, Any]:
 @app.post("/api/articles")
 def add_article(body: AddArticleIn) -> dict[str, Any]:
     if body.url:
-        try:
-            html = extractor.fetch_url(body.url)
-        except Exception as e:
-            raise HTTPException(400, f"fetch failed: {e}")
-        result = extractor.extract(html, url=body.url)
-        title = result["title"] or body.title or body.url
+        # Empty body: the worker fetches (HTML or PDF), drafts, and runs the
+        # Claude cleanup — the same path lloydio-ingested jobs take.
         meta = articles.new_article(
-            title=title,
+            title=body.title or body.url,
             source_url=body.url,
-            body=result["body"],
-            raw_html=html,
-            extraction_method=result["method"],
-            author=result["author"],
-            state="needs_review" if result["confidence_low"] else "queued",
+            body="",
+            raw_html=None,
+            extraction_method="pending",
+            state="queued",
         )
-        tts.worker.kick()  # worker builds book.json (body already extracted)
+        tts.worker.kick()
         return _article_payload(meta["slug"], include_body=True)
     if body.text:
         title = (body.title or body.text.strip().split("\n", 1)[0] or "Pasted").strip()[:120]
@@ -210,33 +247,13 @@ def update_article(slug: str, body: UpdateArticleIn) -> dict[str, Any]:
 @app.post("/api/articles/{slug}/reextract")
 def reextract(slug: str) -> dict[str, Any]:
     meta = articles.load_meta(slug)
-    src = meta.get("source_url")
-    raw = articles.raw_html_path(slug)
-    html: str | None = None
-    if raw.exists():
-        html = raw.read_text(encoding="utf-8")
-    elif src:
-        try:
-            html = extractor.fetch_url(src)
-            raw.write_text(html, encoding="utf-8")
-        except Exception as e:
-            raise HTTPException(400, f"re-fetch failed: {e}")
-    else:
-        raise HTTPException(400, "no source url and no raw html to re-extract from")
-    result = extractor.extract(html, url=src)
-    articles.update_article_text(
-        slug,
-        title=result["title"] or meta.get("title"),
-        author=result["author"] or meta.get("author"),
-        body=result["body"],
-    )
-    articles.set_state(
-        slug,
-        "needs_review" if result["confidence_low"] else "queued",
-        extraction_method=result["method"],
-    )
-    if not result["confidence_low"]:
-        tts.worker.kick()  # rebuild book.json from the re-extracted text
+    has_saved = articles.raw_html_path(slug).exists() or articles.source_pdf_path(slug).exists()
+    if not meta.get("source_url") and not has_saved:
+        raise HTTPException(400, "no source url and no saved source to re-extract from")
+    # Clear the body; the worker re-extracts from the saved source (or re-fetches).
+    articles.update_article_text(slug, title=meta.get("title"), author=meta.get("author"), body="")
+    articles.set_state(slug, "queued", error=None, review_reason=None)
+    tts.worker.kick()
     return _article_payload(slug, include_body=True)
 
 
@@ -273,6 +290,19 @@ def unpublish(slug: str) -> dict[str, Any]:
         raise HTTPException(404, "not found")
     articles.set_state(slug, "stitched", published_at=None)
     return _article_payload(slug)
+
+
+@app.post("/api/articles/{slug}/delete-audio")
+def delete_audio(slug: str) -> dict[str, Any]:
+    """Drop the audio (episode + every Henty take), keep the article text."""
+    if not articles.meta_path(slug).exists():
+        raise HTTPException(404, "not found")
+    if articles.load_meta(slug).get("state") == "synthesizing":
+        raise HTTPException(400, "currently synthesizing; wait for it to finish")
+    _meta, freed = articles.delete_audio(slug)
+    payload = _article_payload(slug)
+    payload["freed_bytes"] = freed
+    return payload
 
 
 @app.delete("/api/articles/{slug}")

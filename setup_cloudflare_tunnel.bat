@@ -43,7 +43,7 @@ echo.
 echo === Step 4 (back in the dashboard): add the Public Hostname ===
 echo   Tunnel ^> Public Hostname ^> Add a public hostname:
 echo     Subdomain: podcast     Domain: ^<your-domain^>
-echo     Type: HTTP   URL: 127.0.0.1:8000
+echo     Type: HTTP   URL: 127.0.0.1:9157
 echo   DNS is auto-created. Do NOT attach a Cloudflare Access policy to this
 echo   hostname -- the podcast feed must stay publicly fetchable.
 echo.

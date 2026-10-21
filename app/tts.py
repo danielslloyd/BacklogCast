@@ -18,13 +18,14 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from dataclasses import asdict
 from pathlib import Path
 
 from mutagen import File as MutagenFile
 
-from . import articles, bookjson, config, extractor, henty
+from . import articles, bookjson, claude_extract, config, extractor, henty, lloydio
 from .articles import article_dir
 
 log = logging.getLogger("backlogcast.tts")
@@ -84,26 +85,78 @@ def _measure_duration_seconds(path: Path) -> int:
 
 # --- Stage B: fetch + extract + build book.json -----------------------------
 
-def build_book(slug: str) -> dict:
-    """Fetch (if needed), extract clean markdown, build Henty book.json, and
-    persist it (to HENTY_BOOKS_DIR/<slug>/ when configured, else the article
-    dir). Advances state to book_built (or needs_review on low confidence)."""
+def _h1_title(md: str) -> str:
+    for line in md.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+        if line.strip():
+            break
+    return ""
+
+
+def extract_source(slug: str) -> str | None:
+    """Fetch the job's URL (reusing a saved raw.html / source.pdf), draft it
+    with trafilatura, then run the Claude cleanup per CLAUDE_EXTRACT. Saves the
+    result as the article body. Returns a review reason when a human should
+    look before synthesis, else None."""
     meta = articles.load_meta(slug)
-    body = articles.load_body(slug)
     url = meta.get("source_url")
-    low = False
-    if not body.strip() and url:
-        html = extractor.fetch_url(url)
-        articles.raw_html_path(slug).write_text(html, encoding="utf-8")
-        result = extractor.extract(html, url=url)
-        articles.update_article_text(
-            slug, title=result["title"] or meta.get("title"),
-            author=result["author"], body=result["body"],
-        )
-        articles.set_state(slug, "extracting", extraction_method=result["method"])
-        low = result["confidence_low"]
+    raw, pdf = articles.raw_html_path(slug), articles.source_pdf_path(slug)
+    if pdf.exists():
+        kind, src = "pdf", pdf
+    elif raw.exists():
+        kind, src = "html", raw
+    else:
+        f = extractor.fetch(url)
+        if f.kind == "pdf":
+            pdf.write_bytes(f.content)
+            kind, src = "pdf", pdf
+        else:
+            raw.write_text(f.text, encoding="utf-8")
+            kind, src = "html", raw
+
+    title, author, draft, method, low = meta.get("title") or "", "", "", "pdf", True
+    if kind == "html":
+        result = extractor.extract(src.read_text(encoding="utf-8"), url=url)
+        draft, method, low = result["body"], result["method"], result["confidence_low"]
+        title, author = result["title"] or title, result["author"]
+
+    body, review = draft, ("low-confidence extraction" if low else None)
+    mode = config.claude_extract_mode()
+    if mode == "always" or (mode == "fallback" and (low or kind == "pdf")):
+        try:
+            cr = claude_extract.clean_with_claude(src, kind, draft)
+            if cr.verdict == "not_article":
+                review = f"Claude: not an article ({cr.reason})"
+            else:
+                body, method = cr.markdown, "claude"
+                title = _h1_title(body) or title
+                review = None
+                if cr.verdict == "suspect":
+                    log.warning("claude cleanup for %s looks off: %s", slug, cr.reason)
+        except claude_extract.ClaudeExtractError as e:
+            log.warning("claude cleanup failed for %s: %s", slug, e)
+            if not draft.strip():
+                raise
+            review = f"Claude cleanup failed ({e}); automatic draft kept"
+
+    if not body.strip():
+        raise RuntimeError(f"no text extracted from {kind}")
+    articles.update_article_text(slug, title=title, author=author, body=body)
+    articles.set_state(slug, "extracting", extraction_method=method)
+    return review
+
+
+def build_book(slug: str) -> dict:
+    """Extract (if the body is still empty), build Henty book.json, and
+    persist it (to HENTY_BOOKS_DIR/<slug>/ when configured, else the article
+    dir). Advances state to book_built (or needs_review when flagged)."""
+    meta = articles.load_meta(slug)
+    review = None
+    if not articles.load_body(slug).strip() and meta.get("source_url"):
+        review = extract_source(slug)
         meta = articles.load_meta(slug)
-        body = articles.load_body(slug)
+    body = articles.load_body(slug)
 
     book = bookjson.build(body, title=meta.get("title") or "")
 
@@ -117,8 +170,9 @@ def build_book(slug: str) -> dict:
         book_path = str(p)
 
     articles.set_state(
-        slug, "needs_review" if low else "book_built",
+        slug, "needs_review" if review else "book_built",
         book_json_path=book_path, n_chunks=len(bookjson.chunk_texts(book)),
+        review_reason=review,
     )
     return book
 
@@ -211,6 +265,12 @@ def synthesize(slug: str) -> None:
                  slug, dur, len(out["reports"]), len(below))
         if config.load_config().get("auto_publish", True):
             articles.set_state(slug, "published", published_at=articles.utcnow_iso())
+            if lloydio.publishable(articles.load_meta(slug)) and config.lloydio_episode_token():
+                try:
+                    lloydio.publish_episode(slug)
+                except Exception:
+                    # stays published locally; publish_pending retries it
+                    log.exception("lloydio write-back failed for %s", slug)
     except Exception as e:
         log.exception("synthesis failed for %s", slug)
         articles.set_state(slug, "failed", error=str(e))
@@ -218,11 +278,15 @@ def synthesize(slug: str) -> None:
 
 # --- background worker ------------------------------------------------------
 
+WRITEBACK_RETRY_SECONDS = 600
+
+
 class TTSWorker:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick = threading.Event()
+        self._last_writeback = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -253,6 +317,9 @@ class TTSWorker:
                 if approved and henty.is_available():
                     synthesize(approved[0]["slug"])
                     continue
+                if time.monotonic() - self._last_writeback > WRITEBACK_RETRY_SECONDS:
+                    self._last_writeback = time.monotonic()
+                    lloydio.publish_pending()
             except Exception:
                 log.exception("worker loop error")
             self._tick.wait(timeout=5.0)
