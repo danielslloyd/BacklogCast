@@ -141,11 +141,17 @@ def publish_episode(
     }
     ctype = "audio/mpeg" if audio.suffix == ".mp3" else "audio/wav"
     try:
-        with httpx.Client(timeout=timeout, transport=transport) as c, audio.open("rb") as fh:
+        # Send the file as bytes so the request has a Content-Length: a chunked
+        # upload reaches the Worker as a stream of unknown length, which R2's
+        # put() rejects (HTTP 500).
+        with httpx.Client(timeout=timeout, transport=transport) as c:
             r = c.post(f"{base}{EPISODE_PATH}", data=fields,
-                       files={"audio": (audio.name, fh, ctype)},
+                       files={"audio": (audio.name, audio.read_bytes(), ctype)},
                        headers={"Authorization": f"Bearer {token}"})
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{r.status_code} from /api/episode: {r.text[:300]}",
+                    request=r.request, response=r)
             res = r.json()
     except (httpx.HTTPError, ValueError) as e:
         articles.set_state(slug, meta["state"], lloydio_error=str(e)[:500])

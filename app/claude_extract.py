@@ -32,7 +32,7 @@ This folder holds one fetched document that will be narrated as a podcast episod
 - `{source}` — the original {kind_desc}
 - `draft.md` — an automatic extraction ({draft_desc})
 
-Read `{source}`{pdf_hint}, use `draft.md` as a head start where it is right, and
+Read `{source}` (with a plain Read — no page ranges), use `draft.md` as a head start where it is right, and
 write `clean.md` in this folder containing ONLY the reading material, as markdown:
 
 - First line: `# <title of the piece>`. Keep the author's section headings as `##`.
@@ -90,7 +90,6 @@ def clean_with_claude(
             kind_desc="PDF" if kind == "pdf" else "web page HTML",
             draft_desc="empty — none for PDFs" if not draft_md.strip()
                        else "may include junk or miss parts",
-            pdf_hint=" (in page ranges of up to 20 pages at a time)" if kind == "pdf" else "",
         ), encoding="utf-8")
         cmd = [
             exe, "-p", "Follow the instructions in instructions.md exactly.",
@@ -101,27 +100,33 @@ def clean_with_claude(
             "--permission-mode", "acceptEdits",
             "--strict-mcp-config",
         ]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=work, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            raise ClaudeExtractError(f"claude timed out after {timeout}s")
-        cost = 0.0
-        try:
-            out = json.loads(proc.stdout or "{}")
-            cost = float(out.get("total_cost_usd") or 0.0)
-            if out.get("is_error"):
-                raise ClaudeExtractError(f"claude error: {str(out.get('result'))[:300]}")
-        except ValueError:
-            pass
-        if proc.returncode != 0:
-            raise ClaudeExtractError(
-                f"claude exited {proc.returncode}: {(proc.stderr or proc.stdout)[-300:]}")
         clean = work / "clean.md"
-        if not clean.exists():
-            raise ClaudeExtractError("claude did not write clean.md")
+        cost, reply = 0.0, ""
+        # One retry when Claude finishes without writing clean.md (it can get
+        # sidetracked by a failed tool call); errors and timeouts aren't retried.
+        for _attempt in range(2):
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=work, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                raise ClaudeExtractError(f"claude timed out after {timeout}s")
+            try:
+                out = json.loads(proc.stdout or "{}")
+                cost += float(out.get("total_cost_usd") or 0.0)
+                reply = str(out.get("result") or "")
+                if out.get("is_error"):
+                    raise ClaudeExtractError(f"claude error: {reply[:300]}")
+            except ValueError:
+                pass
+            if proc.returncode != 0:
+                raise ClaudeExtractError(
+                    f"claude exited {proc.returncode}: {(proc.stderr or proc.stdout)[-300:]}")
+            if clean.exists():
+                break
+        else:
+            raise ClaudeExtractError(f"claude did not write clean.md: {reply[:300]}")
         md = clean.read_text(encoding="utf-8").strip()
 
     if not md:
