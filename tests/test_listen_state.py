@@ -98,9 +98,18 @@ def test_sync_requeues_cancelled_and_reuploads_deleted():
     assert res["requeued"] == [cancelled]
     assert articles.load_meta(cancelled)["state"] == "queued"
 
+    # Uploaded at 12:00. A queue built at 11:00 is stale (pre-rebuild): no-op.
     articles.set_state(cancelled, "published", audio_filename="audio.mp3",
-                       lloydio_published_at="2026-10-21T00:00:00Z")
-    res = lloydio.sync(base_url="https://lloyd.test", transport=q)
+                       lloydio_published_at="2026-10-21T12:00:00Z")
+    stale = httpx.MockTransport(lambda r: httpx.Response(
+        200, json={"generated": "2026-10-21T11:00:00.000Z", "items": [item]}))
+    assert lloydio.sync(base_url="https://lloyd.test", transport=stale)["requeued"] == []
+    assert articles.load_meta(cancelled)["lloydio_published_at"]
+
+    # A queue built after the upload still listing it = deleted and re-queued.
+    fresh = httpx.MockTransport(lambda r: httpx.Response(
+        200, json={"generated": "2026-10-21T13:00:00.000Z", "items": [item]}))
+    res = lloydio.sync(base_url="https://lloyd.test", transport=fresh)
     m = articles.load_meta(cancelled)
     assert res["requeued"] == [cancelled] and m["lloydio_published_at"] is None
     assert lloydio.publishable(m)

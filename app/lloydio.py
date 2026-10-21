@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -51,7 +52,10 @@ def fetch_queue(
         r.raise_for_status()
         data = r.json()
     items = data.get("items", []) if isinstance(data, dict) else []
-    return [it for it in items if isinstance(it, dict)]
+    generated = data.get("generated") if isinstance(data, dict) else None
+    # Each item carries the queue's build time, so sync can tell a stale
+    # listing (built before our upload landed) from a genuine re-queue.
+    return [{**it, "_generated": generated} for it in items if isinstance(it, dict)]
 
 
 def needs_narration(item: dict[str, Any]) -> bool:
@@ -117,6 +121,10 @@ def sync(
     return {"created": created, "requeued": requeued, "skipped": skipped}
 
 
+def _ts(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
 def _revive(meta: dict[str, Any], item: dict[str, Any]) -> bool:
     """Re-activate a local job whose URL is queued again on lloydio."""
     slug, lslug = meta["slug"], item.get("slug") or meta.get("lloydio_slug")
@@ -127,7 +135,12 @@ def _revive(meta: dict[str, Any], item: dict[str, Any]) -> bool:
         _cancel_checked.pop(lslug, None)
         log.info("requeued %s (re-added after cancel)", slug)
         return True
-    if meta.get("state") == "published" and meta.get("lloydio_published_at"):
+    uploaded = meta.get("lloydio_published_at")
+    if meta.get("state") == "published" and uploaded:
+        # Only a queue built *after* our upload means it was deleted and queued
+        # again; an older one just hasn't caught up with the rebuild yet.
+        if not item.get("_generated") or _ts(item["_generated"]) <= _ts(uploaded):
+            return False
         # Deleted on lloydio, then queued again: re-upload the audio we have.
         articles.set_state(slug, "published", lloydio_published_at=None, lloydio_slug=lslug)
         log.info("will re-upload %s (episode deleted on lloydio, re-queued)", slug)
