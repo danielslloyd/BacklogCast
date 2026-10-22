@@ -190,44 +190,102 @@ _henty_seen: tuple[float, bool] = (0.0, False)
 
 
 def _henty_up() -> bool:
-    """henty.is_available, cached briefly: the Queues tab polls every few seconds."""
+    """henty.is_available, cached briefly: the board polls every few seconds."""
     global _henty_seen
     if time.monotonic() - _henty_seen[0] > 15:
         _henty_seen = (time.monotonic(), henty.is_available())
     return _henty_seen[1]
 
 
-def _queue_row(m: dict[str, Any]) -> dict[str, Any]:
-    keys = ("slug", "title", "source_url", "state", "error", "retry_after",
-            "extract_attempts", "synth_attempts", "n_chunks", "narrate", "fetched_at")
-    return {k: m.get(k) for k in keys}
+# --- the board ------------------------------------------------------------
+#
+# The UI is one kanban board: every article sits in exactly one column, and the
+# worker's two queues (extraction, narration) are the columns that carry live
+# progress. The rows are trimmed on purpose -- a full meta carries
+# chunk_reports, which is far too big to poll every couple of seconds.
+
+BOARD_COLUMNS: tuple[dict[str, Any], ...] = (
+    {"key": "intake", "label": "Text queue", "states": ("extracting", "queued")},
+    {"key": "text", "label": "Text ready",
+     "states": ("text_ready", "book_built", "needs_review")},
+    {"key": "narration", "label": "Narration queue", "states": ("synthesizing", "approved")},
+    {"key": "ready", "label": "Ready to publish", "states": ("stitched",)},
+    {"key": "published", "label": "Published", "states": ("published",)},
+    # Catch-all, so a state nobody mapped can never vanish off the board.
+    {"key": "attention", "label": "Needs attention", "states": ("failed", "removed", "cancelled")},
+)
+
+# Columns the worker takes in order: running job first, then next-up first.
+QUEUE_COLUMNS = {"intake": "fetched_at", "narration": "approved_at"}
+RUNNING_STATES = {"extracting", "synthesizing"}
+
+# Everything else: newest first, by the date that column is about.
+_RECENCY_KEY = {"text": "fetched_at", "ready": "fetched_at",
+                "published": "published_at", "attention": "fetched_at"}
+
+_MAPPED_STATES = {s for c in BOARD_COLUMNS[:-1] for s in c["states"]}
+
+_BOARD_FIELDS = (
+    "slug", "title", "author", "publication", "state", "source_url", "error",
+    "retry_after", "extract_attempts", "synth_attempts", "n_chunks", "narrate",
+    "fetched_at", "approved_at", "published_at", "duration_seconds",
+    "audio_filename", "review_reason", "removed_at",
+)
 
 
-@app.get("/api/queues")
-def queues() -> dict[str, Any]:
-    """The worker's two queues in the order it will take them, plus what it's
-    doing now. Mirrors TTSWorker._run: extraction (queued) all goes before
-    synthesis (approved); jobs in retry backoff wait their turn."""
+def _board_row(m: dict[str, Any], queue_pos: int | None = None) -> dict[str, Any]:
+    row = {k: m.get(k) for k in _BOARD_FIELDS}
+    row["running"] = m.get("state") in RUNNING_STATES
+    row["due"] = tts.due(m)
+    row["queue_pos"] = queue_pos
+    return row
+
+
+def _column_items(key: str, metas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if key in QUEUE_COLUMNS:
+        # Mirrors TTSWorker._run: jobs in retry backoff wait their turn.
+        order_by = QUEUE_COLUMNS[key]
+        rows = [_board_row(m) for m in metas if m.get("state") in RUNNING_STATES]
+        waiting = sorted((m for m in metas if m.get("state") not in RUNNING_STATES),
+                         key=lambda m: (not tts.due(m), m.get(order_by) or ""))
+        return rows + [_board_row(m, queue_pos=i) for i, m in enumerate(waiting, 1)]
+    order_by = _RECENCY_KEY[key]
+    metas = sorted(metas, key=lambda m: m.get(order_by) or "", reverse=True)
+    return [_board_row(m) for m in metas]
+
+
+@app.get("/api/board")
+def board() -> dict[str, Any]:
+    """Every article bucketed into its column, plus what the worker is doing
+    right now. The only endpoint the board polls."""
     all_ = list(articles.iter_articles())
-    by = lambda st, key: sorted((m for m in all_ if m.get("state") == st),  # noqa: E731
-                                key=lambda m: (not tts.due(m), m.get(key) or ""))
-    failed = [m for m in all_ if m.get("state") == "failed"]
-    extract_failed = [m for m in failed if str(m.get("error") or "").startswith("extract:")]
-    synth_failed = [m for m in failed if m not in extract_failed]
+    henty_up = _henty_up()
+    columns = []
+    for col in BOARD_COLUMNS:
+        if col["key"] == "attention":  # the catch-all
+            metas = [m for m in all_ if m.get("state") not in _MAPPED_STATES]
+        else:
+            metas = [m for m in all_ if m.get("state") in col["states"]]
+        columns.append({
+            "key": col["key"],
+            "label": col["label"],
+            "items": _column_items(col["key"], metas),
+        })
+    by_key = {c["key"]: c["items"] for c in columns}
+    # Why narration is sitting still, when it is.
+    if any(not r["running"] for r in by_key["narration"]):
+        note = None
+        if not henty_up:
+            note = "Henty is offline — narration waits until it's up."
+        elif any(r["running"] or r["due"] for r in by_key["intake"]):
+            note = "Text extraction goes first."
+        if note:
+            next(c for c in columns if c["key"] == "narration")["note"] = note
     return {
         "now": articles.utcnow_iso(),
         "active": tts.current_progress(),
-        "henty_up": _henty_up(),
-        "extraction": {
-            "running": [_queue_row(m) for m in all_ if m.get("state") == "extracting"],
-            "waiting": [_queue_row(m) for m in by("queued", "fetched_at")],
-            "failed": [_queue_row(m) for m in extract_failed],
-        },
-        "synthesis": {
-            "running": [_queue_row(m) for m in all_ if m.get("state") == "synthesizing"],
-            "waiting": [_queue_row(m) for m in by("approved", "approved_at")],
-            "failed": [_queue_row(m) for m in synth_failed],
-        },
+        "henty_up": henty_up,
+        "columns": columns,
     }
 
 
@@ -446,9 +504,24 @@ def cover() -> Response:
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# Without a Cache-Control header a browser invents its own freshness window
+# (roughly a tenth of the file's age), so a changed UI can sit unseen behind a
+# stale cache. The shell is therefore never stored, and it stamps each asset
+# URL with the newest mtime in static/ so a changed asset gets a fresh URL.
+_ASSET_RE = re.compile(r"(/static/[A-Za-z0-9_.\-]+)")
+
+
+def _asset_version() -> str:
+    newest = max((p.stat().st_mtime for p in STATIC_DIR.iterdir() if p.is_file()), default=0.0)
+    return format(int(newest), "x")
+
+
 @app.get("/")
 def index() -> Response:
-    return FileResponse(str(STATIC_DIR / "index.html"), media_type="text/html")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    version = _asset_version()
+    html = _ASSET_RE.sub(lambda m: f"{m.group(1)}?v={version}", html)
+    return Response(html, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.exception_handler(HTTPException)

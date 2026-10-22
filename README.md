@@ -87,7 +87,7 @@ a tunnel (below) — do not bind `0.0.0.0`.
 
 ## Configuration
 
-Environment variables (each also settable in the Settings tab except the two
+Environment variables (each also settable in the settings popup except the two
 secrets, which are env-only):
 
 | Variable                    | Purpose                                                        |

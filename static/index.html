@@ -10,65 +10,91 @@
 <body>
   <header>
     <h1>BacklogCast</h1>
-    <nav>
-      <button data-tab="queue" class="tab active">Articles</button>
-      <button data-tab="queues" class="tab">Queues</button>
-      <button data-tab="settings" class="tab">Settings</button>
-    </nav>
+    <div class="row grow">
+      <input type="url" id="add-url" placeholder="Paste an article URL…" />
+      <button id="add-url-btn" class="primary">Fetch</button>
+      <button id="paste-toggle" title="Paste cleaned text instead">Paste text</button>
+    </div>
+    <input type="search" id="search" placeholder="Filter by title…" />
+    <span class="status" id="board-status"></span>
+    <button id="menu-btn" class="burger" aria-label="Settings" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
   </header>
 
+  <p id="add-status" class="status bar-status"></p>
+
+  <div id="paste-row" class="card hidden">
+    <div class="col">
+      <input type="text" id="paste-title" placeholder="Title (optional)" />
+      <textarea id="paste-text" rows="8" placeholder="Cleaned article text…"></textarea>
+      <div class="row">
+        <button id="paste-btn" class="primary">Add pasted text</button>
+        <button id="paste-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <main>
-    <section id="tab-queue" class="tab-panel active">
-      <div class="card">
-        <h2>Add article</h2>
-        <div class="row">
-          <input type="url" id="add-url" placeholder="https://example.com/article" />
-          <button id="add-url-btn">Fetch</button>
-        </div>
-        <details>
-          <summary>Paste text instead</summary>
+    <div class="board" id="board"></div>
+  </main>
+
+  <!-- settings popup, opened from the burger -->
+  <div class="overlay hidden" id="settings-overlay">
+    <div class="popup" role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="popup-head">
+        <h2>Settings</h2>
+        <button class="icon-btn" data-close-overlay="settings-overlay" aria-label="Close">✕</button>
+      </div>
+      <div class="popup-body">
+        <section>
+          <h3>Podcast</h3>
           <div class="col">
-            <input type="text" id="paste-title" placeholder="Title (optional)" />
-            <textarea id="paste-text" rows="8" placeholder="Cleaned article text..."></textarea>
-            <button id="paste-btn">Add pasted text</button>
+            <label>Title <input id="cfg-title" /></label>
+            <label>Description <textarea id="cfg-description" rows="3"></textarea></label>
+            <label>Language <input id="cfg-language" /></label>
+            <label>Author <input id="cfg-author" /></label>
+            <label>Owner name <input id="cfg-owner-name" /></label>
+            <label>Owner email <input id="cfg-owner-email" /></label>
+            <label>Category <input id="cfg-category" /></label>
+            <label class="inline"><input id="cfg-explicit" type="checkbox" /> Explicit</label>
+            <label>Public base URL <input id="cfg-base-url" placeholder="https://your.tunnel.example" /></label>
+            <label>Words per minute (estimate) <input id="cfg-wpm" type="number" min="60" max="300" /></label>
+            <div class="row">
+              <button id="save-config" class="primary">Save settings</button>
+              <span class="status" id="config-status"></span>
+            </div>
           </div>
-        </details>
-        <p id="add-status" class="status"></p>
-      </div>
+        </section>
 
-      <div class="card">
-        <div class="row between">
-          <h2>Articles</h2>
+        <section>
+          <h3>Feed tokens</h3>
+          <p class="status">Anyone with a token can fetch the RSS feed and audio. Revoking a token blocks both immediately.</p>
           <div class="row">
-            <label>Filter:
-              <select id="state-filter">
-                <option value="">all</option>
-                <option value="fetched">fetched</option>
-                <option value="needs_review">needs_review</option>
-                <option value="approved">approved</option>
-                <option value="synthesizing">synthesizing</option>
-                <option value="ready">ready</option>
-                <option value="published">published</option>
-                <option value="failed">failed</option>
-              </select>
-            </label>
-            <button id="refresh-btn">Refresh</button>
+            <input id="new-token-name" placeholder="e.g. alice, phone" />
+            <button id="create-token-btn">Create token</button>
           </div>
-        </div>
-        <table id="articles-table">
-          <thead><tr>
-            <th>Title</th><th>State</th><th>Source</th><th>Duration</th><th>Actions</th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
+          <table id="tokens-table">
+            <thead><tr><th>Name</th><th>Feed URL</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
       </div>
+    </div>
+  </div>
 
-      <div class="card hidden" id="preview-card">
-        <div class="row between">
-          <h2 id="preview-title">Preview</h2>
-          <button id="preview-close">close</button>
-        </div>
+  <!-- article detail, opened from a card -->
+  <div class="overlay hidden" id="preview-overlay">
+    <div class="popup wide" role="dialog" aria-modal="true" aria-label="Article">
+      <div class="popup-head">
+        <h2 id="preview-title">Preview</h2>
+        <button class="icon-btn" data-close-overlay="preview-overlay" aria-label="Close">✕</button>
+      </div>
+      <div class="popup-body">
         <p class="status" id="preview-meta"></p>
+        <div id="audio-wrap" class="hidden">
+          <audio id="audio-player" controls></audio>
+        </div>
         <div class="preview-row">
           <div class="preview-col">
             <label>Title <input type="text" id="edit-title" /></label>
@@ -76,78 +102,24 @@
             <label>Markdown
               <textarea id="edit-body" rows="20"></textarea>
             </label>
-            <button id="save-btn">Save edits</button>
           </div>
           <div class="preview-col">
             <div id="rendered" class="rendered"></div>
           </div>
         </div>
-        <div id="audio-wrap" class="hidden">
-          <audio id="audio-player" controls></audio>
-        </div>
-        <div class="row wrap">
-          <button id="reextract-btn">Re-extract</button>
-          <button id="approve-btn" class="primary">Approve for TTS</button>
-          <button id="retry-btn">Retry TTS</button>
-          <button id="publish-btn">Publish</button>
-          <button id="unpublish-btn">Unpublish</button>
-          <button id="delete-btn" class="danger">Delete</button>
-        </div>
       </div>
-    </section>
-
-    <section id="tab-queues" class="tab-panel">
-      <p class="status" id="queues-status">Loading…</p>
-      <div class="queues">
-        <div class="card">
-          <div class="row between">
-            <h2>Text extraction</h2>
-            <span class="status" id="q-extract-count"></span>
-          </div>
-          <ol class="qlist" id="q-extract"></ol>
-        </div>
-        <div class="card">
-          <div class="row between">
-            <h2>Synthesis</h2>
-            <span class="status" id="q-synth-count"></span>
-          </div>
-          <ol class="qlist" id="q-synth"></ol>
-        </div>
+      <div class="popup-foot row wrap">
+        <button id="save-btn" class="primary">Save edits</button>
+        <button id="reextract-btn">Re-extract</button>
+        <button id="approve-btn">Narrate</button>
+        <button id="retry-btn">Retry</button>
+        <button id="publish-btn">Publish</button>
+        <button id="unpublish-btn">Unpublish</button>
+        <button id="delete-audio-btn">Delete audio</button>
+        <button id="delete-btn" class="danger">Delete</button>
       </div>
-    </section>
-
-    <section id="tab-settings" class="tab-panel">
-      <div class="card">
-        <h2>Podcast settings</h2>
-        <div class="col">
-          <label>Title <input id="cfg-title" /></label>
-          <label>Description <textarea id="cfg-description" rows="3"></textarea></label>
-          <label>Language <input id="cfg-language" /></label>
-          <label>Author <input id="cfg-author" /></label>
-          <label>Owner name <input id="cfg-owner-name" /></label>
-          <label>Owner email <input id="cfg-owner-email" /></label>
-          <label>Category <input id="cfg-category" /></label>
-          <label>Explicit <input id="cfg-explicit" type="checkbox" /></label>
-          <label>Public base URL <input id="cfg-base-url" placeholder="https://your.tunnel.example" /></label>
-          <label>Words per minute (estimate) <input id="cfg-wpm" type="number" min="60" max="300" /></label>
-          <button id="save-config">Save settings</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Feed tokens</h2>
-        <p class="status">Anyone with a token can fetch the RSS feed and audio. Revoking a token blocks both immediately.</p>
-        <div class="row">
-          <input id="new-token-name" placeholder="e.g. alice, phone" />
-          <button id="create-token-btn">Create token</button>
-        </div>
-        <table id="tokens-table">
-          <thead><tr><th>Name</th><th>Feed URL</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-  </main>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

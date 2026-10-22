@@ -1,4 +1,8 @@
 // BacklogCast — vanilla JS, no build step.
+//
+// One kanban board polled from /api/board: every article is a card in the
+// column for its state, and the two worker queues are the columns that carry
+// live progress. Settings and the article editor are popups over it.
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -20,100 +24,307 @@ async function api(method, path, body) {
   return ct.includes("application/json") ? res.json() : res.text();
 }
 
-// --- tabs -----------------------------------------------------------------
-$$(".tab").forEach(btn => {
-  btn.addEventListener("click", () => {
-    $$(".tab").forEach(b => b.classList.toggle("active", b === btn));
-    $$(".tab-panel").forEach(p => {
-      p.classList.toggle("active", p.id === `tab-${btn.dataset.tab}`);
-    });
-    if (btn.dataset.tab === "settings") { loadConfig(); loadTokens(); }
-    if (btn.dataset.tab === "queues") refreshQueues();
-  });
-});
-
-// --- add article ---------------------------------------------------------
-$("#add-url-btn").addEventListener("click", async () => {
-  const url = $("#add-url").value.trim();
-  if (!url) return;
-  setStatus("#add-status", "Fetching...");
-  try {
-    const meta = await api("POST", "/api/articles", { url });
-    $("#add-url").value = "";
-    setStatus("#add-status", `Added: ${meta.title}`, "ok");
-    await refreshArticles();
-    openPreview(meta.slug);
-  } catch (e) {
-    setStatus("#add-status", `Error: ${e.message}`, "err");
-  }
-});
-
-$("#paste-btn").addEventListener("click", async () => {
-  const text = $("#paste-text").value.trim();
-  if (!text) return;
-  const title = $("#paste-title").value.trim();
-  setStatus("#add-status", "Saving...");
-  try {
-    const meta = await api("POST", "/api/articles", { title, text });
-    $("#paste-text").value = "";
-    $("#paste-title").value = "";
-    setStatus("#add-status", `Added: ${meta.title}`, "ok");
-    await refreshArticles();
-    openPreview(meta.slug);
-  } catch (e) {
-    setStatus("#add-status", `Error: ${e.message}`, "err");
-  }
-});
-
 function setStatus(sel, text, kind) {
   const el = $(sel);
   el.textContent = text;
   el.style.color = kind === "err" ? "var(--danger)" : kind === "ok" ? "var(--ok)" : "";
 }
 
-// --- articles list -------------------------------------------------------
-$("#refresh-btn").addEventListener("click", refreshArticles);
-$("#state-filter").addEventListener("change", refreshArticles);
+// --- state vocabulary -----------------------------------------------------
+// Must track app/articles.py STATES.
 
-async function refreshArticles() {
-  const state = $("#state-filter").value;
-  const path = state ? `/api/articles?state=${encodeURIComponent(state)}` : "/api/articles";
-  const data = await api("GET", path);
-  const tbody = $("#articles-table tbody");
-  tbody.innerHTML = "";
-  for (const m of data.items) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><a href="#" data-slug="${escapeHtml(m.slug)}" class="open-preview">${escapeHtml(m.title || m.slug)}</a></td>
-      <td><span class="state ${escapeHtml(m.state)}">${escapeHtml(m.state)}</span></td>
-      <td>${m.source_url ? `<a href="${escapeAttr(m.source_url)}" target="_blank" rel="noopener">link</a>` : "—"}</td>
-      <td>${m.duration_seconds ? fmtHMS(m.duration_seconds) : "—"}</td>
-      <td><div class="row"></div></td>
-    `;
-    const actions = $("td:last-child .row", tr);
-    actions.appendChild(makeBtn("preview", () => openPreview(m.slug)));
-    if (["fetched", "needs_review"].includes(m.state)) {
-      actions.appendChild(makeBtn("approve", () => doAction(m.slug, "approve")));
-    }
-    if (m.state === "failed") {
-      actions.appendChild(makeBtn("retry", () => doAction(m.slug, "retry")));
-    }
-    if (m.state === "ready") {
-      actions.appendChild(makeBtn("publish", () => doAction(m.slug, "publish"), "primary"));
-    }
-    if (m.state === "published") {
-      actions.appendChild(makeBtn("unpublish", () => doAction(m.slug, "unpublish")));
-    }
-    if (m.audio_filename || ["stitched", "ready", "published"].includes(m.state)) {
-      actions.appendChild(makeBtn("delete audio", () => confirmDeleteAudio(m.slug)));
-    }
-    actions.appendChild(makeBtn("delete", () => confirmDelete(m.slug), "danger"));
-    tbody.appendChild(tr);
+const STATE_LABEL = {
+  queued: "queued",
+  extracting: "extracting",
+  book_built: "text ready",
+  needs_review: "needs review",
+  approved: "waiting to narrate",
+  synthesizing: "narrating",
+  stitched: "audio ready",
+  published: "published",
+  failed: "failed",
+  text_ready: "text ready",
+  cancelled: "cancelled",
+  removed: "removed",
+};
+
+// The one action that moves a card forward, by state.
+const PRIMARY_ACTION = {
+  text_ready: ["Narrate", "approve"],
+  book_built: ["Narrate", "approve"],
+  needs_review: ["Narrate", "approve"],
+  stitched: ["Publish", "publish"],
+  published: ["Unpublish", "unpublish"],
+  failed: ["Retry", "retry"],
+  cancelled: ["Narrate", "approve"],
+};
+
+// --- overlays (settings popup, article editor) ----------------------------
+
+function openOverlay(id) {
+  $(`#${id}`).classList.remove("hidden");
+  document.body.classList.add("locked");
+}
+
+function closeOverlay(id) {
+  $(`#${id}`).classList.add("hidden");
+  if (!$$(".overlay:not(.hidden)").length) document.body.classList.remove("locked");
+  if (id === "preview-overlay") currentSlug = null;
+}
+
+$$("[data-close-overlay]").forEach(btn => {
+  btn.addEventListener("click", () => closeOverlay(btn.dataset.closeOverlay));
+});
+
+$$(".overlay").forEach(ov => {
+  ov.addEventListener("click", e => { if (e.target === ov) closeOverlay(ov.id); });
+});
+
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  const open = $$(".overlay:not(.hidden)");
+  if (open.length) closeOverlay(open[open.length - 1].id);
+});
+
+$("#menu-btn").addEventListener("click", async () => {
+  const btn = $("#menu-btn");
+  const isOpen = !$("#settings-overlay").classList.contains("hidden");
+  if (isOpen) {
+    closeOverlay("settings-overlay");
+    btn.setAttribute("aria-expanded", "false");
+    return;
   }
-  $$(".open-preview").forEach(a => a.addEventListener("click", e => {
-    e.preventDefault();
-    openPreview(e.target.dataset.slug);
-  }));
+  openOverlay("settings-overlay");
+  btn.setAttribute("aria-expanded", "true");
+  setStatus("#config-status", "");
+  try {
+    await Promise.all([loadConfig(), loadTokens()]);
+  } catch (e) {
+    setStatus("#config-status", `Couldn't load settings: ${e.message}`, "err");
+  }
+});
+
+// --- add article ---------------------------------------------------------
+
+$("#add-url-btn").addEventListener("click", addFromUrl);
+$("#add-url").addEventListener("keydown", e => { if (e.key === "Enter") addFromUrl(); });
+
+async function addFromUrl() {
+  const url = $("#add-url").value.trim();
+  if (!url) return;
+  setStatus("#add-status", "Fetching…");
+  try {
+    const meta = await api("POST", "/api/articles", { url });
+    $("#add-url").value = "";
+    setStatus("#add-status", `Added: ${meta.title}`, "ok");
+    await refreshBoard(true);
+  } catch (e) {
+    setStatus("#add-status", `Error: ${e.message}`, "err");
+  }
+}
+
+$("#paste-toggle").addEventListener("click", () => {
+  $("#paste-row").classList.toggle("hidden");
+  if (!$("#paste-row").classList.contains("hidden")) $("#paste-text").focus();
+});
+$("#paste-cancel").addEventListener("click", () => $("#paste-row").classList.add("hidden"));
+
+$("#paste-btn").addEventListener("click", async () => {
+  const text = $("#paste-text").value.trim();
+  if (!text) return;
+  const title = $("#paste-title").value.trim();
+  setStatus("#add-status", "Saving…");
+  try {
+    const meta = await api("POST", "/api/articles", { title, text });
+    $("#paste-text").value = "";
+    $("#paste-title").value = "";
+    $("#paste-row").classList.add("hidden");
+    setStatus("#add-status", `Added: ${meta.title}`, "ok");
+    await refreshBoard(true);
+  } catch (e) {
+    setStatus("#add-status", `Error: ${e.message}`, "err");
+  }
+});
+
+// --- the board -----------------------------------------------------------
+
+let lastSignature = "";
+let searchTerm = "";
+
+$("#search").addEventListener("input", e => {
+  searchTerm = e.target.value.trim().toLowerCase();
+  lastSignature = "";  // force a redraw with the new filter
+  if (lastBoard) renderBoard(lastBoard);
+});
+
+let lastBoard = null;
+
+async function refreshBoard(force = false) {
+  try {
+    const data = await api("GET", "/api/board");
+    lastBoard = data;
+    if (force) lastSignature = "";
+    renderBoard(data);
+    setStatus("#board-status", data.henty_up ? "" : "Henty offline",
+      data.henty_up ? "" : "err");
+  } catch (e) {
+    setStatus("#board-status", `Offline: ${e.message}`, "err");
+  }
+}
+
+function matchesSearch(item) {
+  if (!searchTerm) return true;
+  return `${item.title || ""} ${item.slug}`.toLowerCase().includes(searchTerm);
+}
+
+function renderBoard(data) {
+  // Redraw only on real change, so hovering a card doesn't fight the poll --
+  // except while a job runs, where the "for 2m" clock has to keep ticking.
+  const running = data.columns.some(c => c.items.some(m => m.running));
+  const signature = JSON.stringify([data.columns, data.active, data.henty_up, searchTerm,
+                                    running ? data.now : ""]);
+  if (signature === lastSignature) return;
+  lastSignature = signature;
+
+  const board = $("#board");
+  const scrolls = {};
+  $$(".col-cards", board).forEach(ul => { scrolls[ul.dataset.key] = ul.scrollTop; });
+
+  board.replaceChildren();
+  for (const col of data.columns) {
+    const shown = col.items.filter(matchesSearch);
+    const section = document.createElement("section");
+    section.className = "column";
+    section.dataset.key = col.key;
+
+    const head = document.createElement("header");
+    head.className = "col-head";
+    head.innerHTML = `<h2>${escapeHtml(col.label)}</h2>` +
+      `<span class="count">${shown.length}${shown.length !== col.items.length ? ` / ${col.items.length}` : ""}</span>`;
+    section.append(head);
+
+    if (col.note) {
+      const note = document.createElement("p");
+      note.className = "col-note";
+      note.textContent = col.note;
+      section.append(note);
+    }
+
+    const ul = document.createElement("ul");
+    ul.className = "col-cards";
+    ul.dataset.key = col.key;
+    if (!shown.length) {
+      const li = document.createElement("li");
+      li.className = "col-empty";
+      li.textContent = col.items.length ? "Nothing matches the filter." : "Empty.";
+      ul.append(li);
+    }
+    shown.forEach(item => ul.append(card(item, data)));
+    section.append(ul);
+    board.append(section);
+  }
+
+  $$(".col-cards", board).forEach(ul => {
+    if (scrolls[ul.dataset.key]) ul.scrollTop = scrolls[ul.dataset.key];
+  });
+}
+
+function card(m, data) {
+  const li = document.createElement("li");
+  li.className = "card-item";
+  li.dataset.slug = m.slug;
+  if (m.running) li.classList.add("running");
+  if (m.state === "failed") li.classList.add("failed");
+  if (!m.due) li.classList.add("backoff");
+  if (m.state === "removed") li.classList.add("muted");
+
+  const title = document.createElement("button");
+  title.className = "card-title";
+  title.textContent = m.title || m.slug;
+  title.addEventListener("click", () => openPreview(m.slug));
+  li.append(title);
+
+  const by = [m.author, m.publication].filter(Boolean).join(" · ");
+  if (by) {
+    const el = document.createElement("div");
+    el.className = "card-by";
+    el.textContent = by;
+    li.append(el);
+  }
+
+  const bits = statusBits(m, data);
+  if (bits.length) {
+    const el = document.createElement("div");
+    el.className = "card-status";
+    el.textContent = bits.join(" · ");
+    li.append(el);
+  }
+
+  const a = data.active || {};
+  if (m.running && a.slug === m.slug) {
+    const bar = document.createElement("div");
+    bar.className = a.total ? "bar" : "bar indeterminate";
+    bar.innerHTML = `<span style="width:${a.total ? Math.round(100 * (a.done || 0) / a.total) : 30}%"></span>`;
+    li.append(bar);
+  }
+
+  const primary = PRIMARY_ACTION[m.state];
+  const actions = document.createElement("div");
+  actions.className = "card-actions";
+  const pill = document.createElement("span");
+  pill.className = `state ${m.state}`;
+  pill.textContent = STATE_LABEL[m.state] || m.state;
+  actions.append(pill);
+  if (m.source_url) {
+    const link = document.createElement("a");
+    link.href = m.source_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.className = "card-link";
+    link.textContent = "source";
+    actions.append(link);
+  }
+  const spacer = document.createElement("span");
+  spacer.className = "spacer";
+  actions.append(spacer);
+  if (primary) {
+    actions.append(makeBtn(primary[0], () => doAction(m.slug, primary[1]),
+      m.state === "stitched" ? "primary" : ""));
+  }
+  li.append(actions);
+  return li;
+}
+
+function statusBits(m, data) {
+  const bits = [];
+  const a = data.active || {};
+  if (m.running) {
+    if (a.slug === m.slug) {
+      bits.push(a.step + (a.total ? ` — chunk ${a.done || 0} of ${a.total}` : ""));
+      bits.push(`for ${fmtElapsed(a.started, data.now)}`);
+    } else {
+      bits.push("starting…");
+    }
+    return bits;
+  }
+  if (!m.due && m.retry_after) {
+    const stage = m.state === "approved" ? "synth" : "extract";
+    const attempts = stage === "synth" ? m.synth_attempts : m.extract_attempts;
+    bits.push(`retry at ${fmtWhen(m.retry_after)} (attempt ${(attempts || 0) + 1} of 4)`);
+  } else if (m.queue_pos && m.queue_pos > 1) {
+    bits.push(`#${m.queue_pos} in line`);
+  } else if (m.queue_pos === 1) {
+    bits.push("next up");
+  }
+  if (m.state === "failed" && m.error) bits.push(m.error);
+  if (m.state === "removed") bits.push("taken off the reading list");
+  if (m.state === "needs_review" && m.review_reason) bits.push(m.review_reason);
+  if (m.duration_seconds) bits.push(fmtHMS(m.duration_seconds));
+  else if (m.n_chunks) bits.push(`${m.n_chunks} chunks`);
+  if (m.narrate && ["text_ready", "book_built", "queued"].includes(m.state)) {
+    bits.push("narration requested");
+  }
+  return bits;
 }
 
 function makeBtn(label, onClick, cls) {
@@ -127,7 +338,7 @@ function makeBtn(label, onClick, cls) {
 async function doAction(slug, action) {
   try {
     await api("POST", `/api/articles/${encodeURIComponent(slug)}/${action}`);
-    await refreshArticles();
+    await refreshBoard(true);
     if (currentSlug === slug) await openPreview(slug);
   } catch (e) {
     alert(`Action failed: ${e.message}`);
@@ -139,60 +350,53 @@ async function confirmDeleteAudio(slug) {
     `Delete the audio for "${slug}"?\n\n` +
     `The article text is kept. This also clears Henty's project folder ` +
     `(every per-chunk take) and removes it from the feed.\n\n` +
-    `Use "approve" to re-narrate it later.`
+    `Use "Narrate" to re-narrate it later.`
   )) return;
   try {
     const m = await api("POST", `/api/articles/${encodeURIComponent(slug)}/delete-audio`);
-    await refreshArticles();
-    if (currentSlug === slug) await openPreview(slug);
     setStatus("#add-status", `Deleted audio for "${slug}" — freed ${fmtBytes(m.freed_bytes)}.`, "ok");
+    await refreshBoard(true);
+    if (currentSlug === slug) await openPreview(slug);
   } catch (e) {
     alert(`Delete audio failed: ${e.message}`);
   }
-}
-
-function fmtBytes(n) {
-  n = Number(n || 0);
-  if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let i = -1;
-  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
-  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
 }
 
 async function confirmDelete(slug) {
   if (!confirm(`Delete "${slug}"? This removes the audio and metadata.`)) return;
   try {
     await api("DELETE", `/api/articles/${encodeURIComponent(slug)}`);
-    if (currentSlug === slug) closePreview();
-    await refreshArticles();
+    if (currentSlug === slug) closeOverlay("preview-overlay");
+    await refreshBoard(true);
   } catch (e) {
     alert(`Delete failed: ${e.message}`);
   }
 }
 
-// --- preview pane --------------------------------------------------------
+// --- article editor ------------------------------------------------------
+
 let currentSlug = null;
 
 async function openPreview(slug) {
   currentSlug = slug;
-  $("#preview-card").classList.remove("hidden");
-  $("#preview-card").scrollIntoView({ behavior: "smooth", block: "start" });
+  openOverlay("preview-overlay");
   const m = await api("GET", `/api/articles/${encodeURIComponent(slug)}`);
+  if (currentSlug !== slug) return;  // closed while loading
   $("#preview-title").textContent = m.title || slug;
   $("#edit-title").value = m.title || "";
   $("#edit-author").value = m.author || "";
   $("#edit-body").value = m.body || "";
   renderPreview(m.body || "");
   const estMin = Math.round((m.estimated_seconds || 0) / 60);
-  $("#preview-meta").textContent = `state: ${m.state} · ${m.word_count} words · ~${estMin} min · source: ${m.source_url || "(none)"} · method: ${m.extraction_method}${m.error ? " · error: " + m.error : ""}`;
-  // audio
-  if (m.state === "published" || m.state === "ready") {
-    // ready audio isn't behind a token — we only stream via published. For local preview, fetch it directly via a temporary inline player from filesystem-only? We don't have such an endpoint. Just show player when published.
-  }
+  $("#preview-meta").textContent =
+    `${STATE_LABEL[m.state] || m.state} · ${m.word_count} words · ~${estMin} min` +
+    ` · ${m.extraction_method}${m.source_url ? " · " + m.source_url : ""}` +
+    `${m.error ? " · error: " + m.error : ""}`;
+  showPreviewActions(m);
+
   const aw = $("#audio-wrap");
   if (m.state === "published") {
-    // pick any token to preview
+    // Audio is only served behind a feed token, so borrow one to preview it.
     const t = await api("GET", "/api/tokens");
     const tok = t.tokens[0]?.token;
     const ext = (m.audio_filename || "audio.mp3").split(".").pop();
@@ -208,17 +412,25 @@ async function openPreview(slug) {
   }
 }
 
+function showPreviewActions(m) {
+  const show = {
+    "approve-btn": ["text_ready", "book_built", "needs_review", "cancelled"].includes(m.state),
+    "retry-btn": m.state === "failed" || !!m.retry_after,
+    "publish-btn": m.state === "stitched",
+    "unpublish-btn": m.state === "published",
+    "delete-audio-btn": !!m.audio_filename || ["stitched", "published"].includes(m.state),
+    "reextract-btn": !!m.source_url,
+  };
+  for (const [id, on] of Object.entries(show)) {
+    $(`#${id}`).classList.toggle("hidden", !on);
+  }
+}
+
 function renderPreview(md) {
   $("#rendered").innerHTML = marked.parse(md || "");
 }
 
 $("#edit-body").addEventListener("input", e => renderPreview(e.target.value));
-
-$("#preview-close").addEventListener("click", closePreview);
-function closePreview() {
-  currentSlug = null;
-  $("#preview-card").classList.add("hidden");
-}
 
 $("#save-btn").addEventListener("click", async () => {
   if (!currentSlug) return;
@@ -228,7 +440,7 @@ $("#save-btn").addEventListener("click", async () => {
       author: $("#edit-author").value,
       body: $("#edit-body").value,
     });
-    await refreshArticles();
+    await refreshBoard(true);
     await openPreview(currentSlug);
   } catch (e) { alert(`Save failed: ${e.message}`); }
 });
@@ -242,9 +454,11 @@ for (const [id, action] of [
 ]) {
   $(`#${id}`).addEventListener("click", () => currentSlug && doAction(currentSlug, action));
 }
+$("#delete-audio-btn").addEventListener("click", () => currentSlug && confirmDeleteAudio(currentSlug));
 $("#delete-btn").addEventListener("click", () => currentSlug && confirmDelete(currentSlug));
 
 // --- settings ------------------------------------------------------------
+
 async function loadConfig() {
   const c = await api("GET", "/api/config");
   $("#cfg-title").value = c.podcast_title;
@@ -273,14 +487,16 @@ $("#save-config").addEventListener("click", async () => {
       public_base_url: $("#cfg-base-url").value,
       wpm: parseInt($("#cfg-wpm").value || "160", 10),
     });
-    alert("Saved.");
-  } catch (e) { alert(`Save failed: ${e.message}`); }
+    setStatus("#config-status", "Saved.", "ok");
+  } catch (e) {
+    setStatus("#config-status", `Save failed: ${e.message}`, "err");
+  }
 });
 
 async function loadTokens() {
   const data = await api("GET", "/api/tokens");
   const tbody = $("#tokens-table tbody");
-  tbody.innerHTML = "";
+  tbody.replaceChildren();
   const base = location.origin;
   for (const t of data.tokens) {
     const tr = document.createElement("tr");
@@ -308,10 +524,13 @@ $("#create-token-btn").addEventListener("click", async () => {
     await api("POST", "/api/tokens", { name });
     $("#new-token-name").value = "";
     await loadTokens();
-  } catch (e) { alert(`Create failed: ${e.message}`); }
+  } catch (e) {
+    setStatus("#config-status", `Create failed: ${e.message}`, "err");
+  }
 });
 
 // --- helpers -------------------------------------------------------------
+
 function fmtHMS(sec) {
   sec = parseInt(sec || 0, 10);
   const h = Math.floor(sec / 3600);
@@ -319,114 +538,33 @@ function fmtHMS(sec) {
   const s = sec % 60;
   return (h ? `${h}:` : "") + `${String(m).padStart(h ? 2 : 1, "0")}:${String(s).padStart(2, "0")}`;
 }
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-function escapeAttr(s) { return escapeHtml(s); }
 
-// --- auto-refresh while there are in-flight items -----------------------
-setInterval(async () => {
-  try {
-    const data = await api("GET", "/api/articles");
-    const busy = data.items.some(m => m.state === "approved" || m.state === "synthesizing");
-    if (busy) await refreshArticles();
-  } catch {}
-}, 5000);
-
-// --- queues tab: live view of what the worker will do, in order ------------
 function fmtWhen(iso) {
   return iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
 }
+
 function fmtElapsed(fromIso, nowIso) {
+  if (!fromIso) return "a moment";
   const s = Math.max(0, (Date.parse(nowIso) - Date.parse(fromIso)) / 1000);
   return s < 60 ? `${Math.round(s)}s` : fmtHMS(s);
 }
 
-function queueItem(m, kind, data) {
-  const li = document.createElement("li");
-  const attempts = kind === "extract" ? m.extract_attempts : m.synth_attempts;
-  const bits = [];
-  const a = data.active;
-  if (kind === "running") {
-    li.className = "running";
-    if (a.slug === m.slug) {
-      bits.push(a.step + (a.total ? ` — chunk ${a.done || 0} of ${a.total}` : ""));
-      bits.push(`for ${fmtElapsed(a.started, data.now)}`);
-    } else {
-      bits.push("starting…");
-    }
-  } else if (kind === "failed") {
-    li.className = "failed";
-    bits.push(m.error || "failed");
-  } else {
-    if (m.retry_after && m.retry_after > data.now) {
-      li.className = "backoff";
-      bits.push(`retry at ${fmtWhen(m.retry_after)} (attempt ${(attempts || 0) + 1} of 4)`);
-      if (m.error) bits.push(m.error);
-    } else if (attempts) {
-      bits.push(`attempt ${attempts + 1} of 4`);
-    }
-    if (kind === "extract" && m.narrate !== false) bits.push("narration requested");
-    if (kind === "synth" && m.n_chunks) bits.push(`${m.n_chunks} chunks`);
-  }
-  li.innerHTML = `<span class="qtitle">${escapeHtml(m.title || m.slug)}</span>` +
-    `<span class="qmeta">${bits.map(escapeHtml).join(" · ")}</span>`;
-  if (kind === "running" && a.slug === m.slug) {
-    const bar = document.createElement("div");
-    bar.className = a.total ? "bar" : "bar indeterminate";
-    bar.innerHTML = `<span style="width:${a.total ? Math.round(100 * (a.done || 0) / a.total) : 30}%"></span>`;
-    li.append(bar);
-  }
-  if (kind === "failed") {
-    li.append(makeBtn("Retry", async () => { await doAction(m.slug, "retry"); refreshQueues(); }));
-  }
-  return li;
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
 }
 
-function renderQueue(ol, q, kind, data, idleNote) {
-  ol.replaceChildren();
-  q.running.forEach(m => ol.append(queueItem(m, "running", data)));
-  q.waiting.forEach(m => ol.append(queueItem(m, kind, data)));
-  if (!q.running.length && !q.waiting.length) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "Nothing waiting.";
-    ol.append(li);
-  } else if (idleNote) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = idleNote;
-    ol.prepend(li);
-  }
-  if (q.failed.length) {
-    const sep = document.createElement("li");
-    sep.className = "qsep";
-    sep.textContent = `Gave up (${q.failed.length})`;
-    ol.append(sep);
-    q.failed.forEach(m => ol.append(queueItem(m, "failed", data)));
-  }
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-async function refreshQueues() {
-  try {
-    const data = await api("GET", "/api/queues");
-    const e = data.extraction, s = data.synthesis;
-    renderQueue($("#q-extract"), e, "extract", data);
-    const textFirst = e.running.length || e.waiting.some(m => !(m.retry_after > data.now));
-    renderQueue($("#q-synth"), s, "synth", data,
-      !data.henty_up ? "Henty is offline — synthesis waits until it's up."
-        : textFirst && s.waiting.length ? "Waiting for text extraction to finish (text goes first)." : "");
-    $("#q-extract-count").textContent = `${e.running.length + e.waiting.length} queued`;
-    $("#q-synth-count").textContent = `${s.running.length + s.waiting.length} queued`;
-    setStatus("#queues-status", `Live — updated ${fmtWhen(data.now)}`);
-  } catch (err) {
-    setStatus("#queues-status", `Couldn't load queues: ${err.message}`, "err");
-  }
-}
+// --- live updates --------------------------------------------------------
 
-setInterval(() => {
-  if ($("#tab-queues").classList.contains("active") && !document.hidden) refreshQueues();
-}, 2000);
+setInterval(() => { if (!document.hidden) refreshBoard(); }, 2000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshBoard(); });
 
-// initial load
-refreshArticles();
+refreshBoard();

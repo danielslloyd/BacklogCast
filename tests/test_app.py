@@ -58,7 +58,7 @@ def test_add_text_article_creates_queued_job():
     assert body["slug"]
 
 
-def test_queues_lists_work_in_worker_order(monkeypatch):
+def test_board_buckets_articles_in_worker_order(monkeypatch):
     from app import articles, henty, main, tts
     monkeypatch.setattr(henty, "is_available", lambda *a, **k: False)
     main._henty_seen = (0.0, False)
@@ -69,15 +69,49 @@ def test_queues_lists_work_in_worker_order(monkeypatch):
     mk("now", "queued")
     mk("narrate", "approved", approved_at="2026-01-01T00:00:00Z")
     mk("broke", "failed", error="extract: boom")
+    mk("read", "text_ready")
     running = mk("busy", "synthesizing")
     tts.set_progress(running["slug"], "synth", "narrating", 3, 10)
     try:
-        q = client.get("/api/queues").json()
+        b = client.get("/api/board").json()
     finally:
         tts.clear_progress(running["slug"])
-    assert [m["title"] for m in q["extraction"]["waiting"]] == ["now", "later"]
-    assert [m["title"] for m in q["extraction"]["failed"]] == ["broke"]
-    assert [m["title"] for m in q["synthesis"]["waiting"]] == ["narrate"]
-    assert q["synthesis"]["running"][0]["title"] == "busy"
-    assert q["active"]["done"] == 3 and q["active"]["total"] == 10
-    assert q["henty_up"] is False
+    cols = {c["key"]: c for c in b["columns"]}
+    titles = lambda k: [m["title"] for m in cols[k]["items"]]  # noqa: E731
+    # Backoff waits its turn, and the running job heads its column.
+    assert titles("intake") == ["now", "later"]
+    assert [m["queue_pos"] for m in cols["intake"]["items"]] == [1, 2]
+    assert cols["intake"]["items"][1]["due"] is False
+    assert titles("narration") == ["busy", "narrate"]
+    assert cols["narration"]["items"][0]["running"] is True
+    assert titles("text") == ["read"]
+    assert titles("attention") == ["broke"]
+    assert b["active"]["done"] == 3 and b["active"]["total"] == 10
+    assert b["henty_up"] is False
+    # Henty being down is why narration is idle, and the board says so.
+    assert "offline" in cols["narration"]["note"]
+
+
+def test_board_covers_every_state():
+    from app import articles
+    from app.main import BOARD_COLUMNS
+    mapped = {s for c in BOARD_COLUMNS for s in c["states"]}
+    assert articles.STATES - mapped == set(), "a state no column shows"
+
+
+def test_board_rows_omit_chunk_reports():
+    """The board polls every couple of seconds; chunk_reports is far too big."""
+    from app import articles
+    slug = articles.new_article(title="big", source_url=None, body="hi", raw_html=None,
+                                extraction_method="manual")["slug"]
+    articles.set_state(slug, "stitched", chunk_reports=[{"i": i} for i in range(200)])
+    b = client.get("/api/board").json()
+    row = next(m for c in b["columns"] for m in c["items"] if m["slug"] == slug)
+    assert "chunk_reports" not in row
+
+
+def test_index_is_never_cached_and_stamps_its_assets():
+    """A stale shell hides every UI change; the assets it names must bust too."""
+    r = client.get("/")
+    assert r.headers["cache-control"] == "no-store"
+    assert "/static/app.js?v=" in r.text and "/static/style.css?v=" in r.text
