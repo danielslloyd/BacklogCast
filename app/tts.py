@@ -64,7 +64,10 @@ def _wav_to_mp3(src: Path, dst: Path) -> bool:
         return False
     result = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-         "-codec:a", "libmp3lame", "-qscale:a", "4", str(dst)],
+         # 32k mono: a single narrated voice at 24 kHz needs no more, and it
+         # keeps even a four-hour episode under the 100 MiB request body cap
+         # Cloudflare puts in front of lloydio's /api/episode.
+         "-codec:a", "libmp3lame", "-b:a", "32k", "-ac", "1", str(dst)],
         capture_output=True, text=True,
     )
     return result.returncode == 0 and Path(dst).exists()
