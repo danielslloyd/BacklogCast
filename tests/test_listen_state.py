@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from app import articles, henty, lloydio, tts
+from app import articles, bookjson, henty, lloydio, tts
 
 
 @pytest.fixture(autouse=True)
@@ -220,3 +220,72 @@ def test_readded_link_revives_removed_job():
     lloydio.sync(transport=_queue(_item(needs_text=True)))  # built 13:00, after
     m = articles.load_meta(slug)
     assert m["state"] == "text_ready" and not m.get("removed_at")
+
+
+# --- narrating text lloydio already has (e.g. an emailed, paywalled piece) ---
+
+LLOYDIO_ARTICLE = (
+    '---\ntitle: "Money Stuff: Musk’s Pay"\nurl: "https://x/a"\nauthor: "Matt Levine"\n'
+    'source: "Bloomberg Opinion"\npublished: "2026-10-27"\ndate: 2026-10-27T18:22:59.000Z\n'
+    'status: ready\ndraft: true\n---\n\n# Money Stuff: Musk’s Pay\n\n'
+    'The full emailed text.\n\n*[image: A chart]*\n\nMore text.\n'
+)
+
+
+def _site(items, article_status=200, seen=None):
+    """Fake lloydio queue (with repo/branch) plus the raw article host."""
+    def handler(req):
+        if req.url.path == "/api/podcast-queue.json":
+            return httpx.Response(200, json={
+                "version": 2, "generated": "2026-10-21T13:00:00.000Z",
+                "repo": "o/r", "branch": "main", "items": items})
+        if seen is not None:
+            seen.append(str(req.url))
+        return httpx.Response(article_status, text=LLOYDIO_ARTICLE)
+    return httpx.MockTransport(handler)
+
+
+def _existing(**extra):
+    return {**_item(needs_audio=True), "article_exists": True, **extra}
+
+
+def test_sync_seeds_narration_job_with_lloydios_text():
+    item = _existing(article_raw_url="https://raw.test/a.md")
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_site([item]))
+    [m] = list(articles.iter_articles())
+    assert res["created"] == [m["slug"]]
+    assert m["narrate"] is True and m["extraction_method"] == "lloydio-article"
+    assert m["title"] == "Money Stuff: Musk’s Pay" and m["author"] == "Matt Levine"
+    assert m["publication"] == "Bloomberg Opinion" and m["published"] == "2026-10-27"
+    assert m["lloydio_slug"] == "t-abc" and m["lloydio_text_published_at"]
+    assert "The full emailed text." in articles.load_body(m["slug"])
+
+
+def test_seeded_job_is_narrated_without_refetching_the_source(monkeypatch):
+    lloydio.sync(base_url="https://lloyd.test",
+                 transport=_site([_existing(article_raw_url="https://raw.test/a.md")]))
+    [m] = list(articles.iter_articles())
+
+    def no_fetch(*a, **k):
+        raise AssertionError("re-fetched the source")
+    monkeypatch.setattr(tts, "extract_source", no_fetch)
+    book = tts.build_book(m["slug"])
+    spoken = " ".join(bookjson.chunk_texts(book))
+    assert "The full emailed text." in spoken and "More text." in spoken
+    assert "image" not in spoken  # placeholders stay in the text, not the audio
+    assert "*[image: A chart]*" in articles.load_body(m["slug"])
+    assert articles.load_meta(m["slug"])["state"] == "book_built"
+
+
+def test_sync_builds_raw_url_from_repo_when_not_given():
+    seen = []
+    item = _existing(article_path="src/content/articles/t-abc.md")
+    lloydio.sync(base_url="https://lloyd.test", transport=_site([item], seen=seen))
+    assert seen == ["https://raw.githubusercontent.com/o/r/main/src/content/articles/t-abc.md"]
+
+
+def test_sync_waits_when_lloydios_text_is_unreachable():
+    item = _existing(article_raw_url="https://raw.test/a.md")
+    res = lloydio.sync(base_url="https://lloyd.test", transport=_site([item], article_status=503))
+    assert res["created"] == [] and res["skipped"] == ["https://x/a"]
+    assert list(articles.iter_articles()) == []  # no job that would re-scrape it

@@ -13,6 +13,12 @@ audio). We dedupe against the local store by `source_url` and create jobs in
 state `queued`; the TTS worker then extracts, builds book.json, drives Henty,
 and publishes to the local feed.
 
+When lloydio already has an item's clean text (`article_exists`, e.g. a
+newsletter whose full text arrived by email), the new job starts from that text
+(`article_raw_url`, or repo/branch/article_path) instead of re-fetching the
+source, which may be paywalled. If that text can't be fetched, the item waits
+for the next poll rather than being re-scraped.
+
 Write-back (Stage E): `publish_episode` POSTs the finished mp3 + clean text to
 lloydio's `/api/episode` (Bearer LLOYDIO_EPISODE_TOKEN). lloydio stores the mp3
 in R2 and commits `src/content/articles/<slug>.md`, which takes the item off the
@@ -21,6 +27,7 @@ queue and puts it in the always-on feed. Uploads that fail are retried by
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime
@@ -53,9 +60,65 @@ def fetch_queue(
         data = r.json()
     items = data.get("items", []) if isinstance(data, dict) else []
     generated = data.get("generated") if isinstance(data, dict) else None
+    repo = data.get("repo") if isinstance(data, dict) else None
+    branch = data.get("branch") if isinstance(data, dict) else None
     # Each item carries the queue's build time, so sync can tell a stale
-    # listing (built before our upload landed) from a genuine re-queue.
-    return [{**it, "_generated": generated} for it in items if isinstance(it, dict)]
+    # listing (built before our upload landed) from a genuine re-queue, and
+    # the repo it lives in, for fetching existing article text.
+    return [{**it, "_generated": generated, "_repo": repo, "_branch": branch}
+            for it in items if isinstance(it, dict)]
+
+
+RAW_BASE = "https://raw.githubusercontent.com"
+
+
+def article_text_url(item: dict[str, Any]) -> str:
+    """Where lloydio's existing article markdown for this item lives ('' if unknown)."""
+    if item.get("article_raw_url"):
+        return item["article_raw_url"]
+    repo, path = item.get("_repo"), item.get("article_path")
+    if repo and path:
+        return f"{RAW_BASE}/{repo}/{item.get('_branch') or 'main'}/{path}"
+    return ""
+
+
+def _unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            return str(json.loads(v))
+        except ValueError:
+            return v[1:-1]
+    return v
+
+
+def fetch_article(
+    item: dict[str, Any],
+    timeout: float = 30.0,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, str] | None:
+    """lloydio's existing clean text for a queue item, as {title, author,
+    publication, published, body}; None if it has none. Raises (httpx.HTTPError)
+    if the text exists but can't be fetched right now."""
+    if not item.get("article_exists"):
+        return None
+    url = article_text_url(item)
+    if not url:
+        return None
+    with httpx.Client(timeout=timeout, follow_redirects=True, transport=transport) as c:
+        r = c.get(url)
+        r.raise_for_status()
+    fm, body = articles.split_frontmatter(r.text)
+    if not body.strip():
+        return None
+    fm = {k: _unquote(v) for k, v in fm.items()}
+    return {
+        "title": fm.get("title", ""),
+        "author": fm.get("author", ""),
+        "publication": fm.get("source", ""),
+        "published": fm.get("published", ""),
+        "body": body.strip() + "\n",
+    }
 
 
 def wants(item: dict[str, Any]) -> tuple[bool, bool]:
@@ -109,25 +172,40 @@ def sync(
         if not create:
             created.append(url)
             continue
+        try:
+            article = fetch_article(item, transport=transport)
+        except (httpx.HTTPError, ValueError) as e:
+            # The text exists on lloydio; never fall back to re-scraping a
+            # source that may be paywalled. Try again on the next poll.
+            log.warning("couldn't fetch lloydio's text for %s (%s); retrying next poll", url, e)
+            skipped.append(url)
+            continue
         meta = articles.new_article(
-            title=item.get("title") or url,
+            title=(article or {}).get("title") or item.get("title") or url,
             source_url=url,
-            body="",
+            body=article["body"] if article else "",
             raw_html=None,
-            extraction_method="lloydio-queue",
-            author="",
+            extraction_method="lloydio-article" if article else "lloydio-queue",
+            author=(article or {}).get("author", ""),
             state="queued",
         )
+        extra: dict[str, Any] = {}
+        if article:
+            extra = {k: article[k] for k in ("publication", "published") if article[k]}
+            # Its text is already on lloydio: nothing to send back for text-only.
+            extra["lloydio_text_published_at"] = articles.utcnow_iso()
         articles.set_state(
             meta["slug"],
             "queued",
             lloydio_slug=item.get("slug"),
             tags=item.get("tags") or [],
             narrate=needs_audio,
+            **extra,
         )
         created.append(meta["slug"])
-        log.info("queued from lloydio: %s (%s)%s", meta["slug"], url,
-                 " for narration" if needs_audio else "")
+        log.info("queued from lloydio: %s (%s)%s%s", meta["slug"], url,
+                 " for narration" if needs_audio else "",
+                 " using lloydio's text" if article else "")
     log.info("lloydio sync: +%d new, %d updated, %d skipped",
              len(created), len(requeued), len(skipped))
     return {"created": created, "requeued": requeued, "skipped": skipped}

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -285,6 +286,16 @@ def intro_text(meta: dict, title_spoken: bool) -> str:
     return " ".join(bits)
 
 
+# Image stand-ins in text that came from lloydio (`*[image]*` or
+# `*[image: caption]*` on a line of their own): kept in the article, not spoken.
+_IMAGE_PLACEHOLDER_RE = re.compile(r"^[ \t]*\*\[image(?::[^\]\n]*)?\]\*[ \t]*$", re.MULTILINE)
+
+
+def narration_text(body: str) -> str:
+    """The article body as it should be read aloud."""
+    return _IMAGE_PLACEHOLDER_RE.sub("", body)
+
+
 def build_book(slug: str, last_try: bool = True) -> dict:
     """Extract (if the body is still empty), build Henty book.json, and
     persist it (to HENTY_BOOKS_DIR/<slug>/ when configured, else the article
@@ -294,7 +305,7 @@ def build_book(slug: str, last_try: bool = True) -> dict:
     if not articles.load_body(slug).strip() and meta.get("source_url"):
         review = extract_source(slug, last_try=last_try)
         meta = articles.load_meta(slug)
-    body = articles.load_body(slug)
+    body = narration_text(articles.load_body(slug))
 
     set_progress(slug, "extract", "building book.json")
     book = bookjson.build(body, title=meta.get("title") or "",
